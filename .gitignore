@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+*.db
+*.db-wal
+*.db-shm
+server/data/
+server/playwright-data/
+client/dist/
+.context/
+.port
