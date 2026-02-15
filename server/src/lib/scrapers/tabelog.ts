@@ -136,7 +136,8 @@ export async function browseTabelog(
 
   try {
     await pageObj.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await pageObj.waitForTimeout(3000);
+    // Wait for actual restaurant list content instead of a blind 3s timer
+    await pageObj.locator('.list-rst').first().waitFor({ timeout: 5000 }).catch(() => {});
 
     // Use locators to extract data server-side (avoids tsx __name issue with evaluate)
     const items = pageObj.locator('.list-rst');

@@ -2,7 +2,7 @@
   "name": "japan-planner",
   "private": true,
   "scripts": {
-    "dev": "concurrently -n server,client -c blue,green \"npm run dev -w server\" \"npm run dev -w client\"",
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev -w server\" \"node scripts/wait-for-server.cjs && npm run dev -w client\"",
     "dev:server": "npm run dev -w server",
     "dev:client": "npm run dev -w client"
   },

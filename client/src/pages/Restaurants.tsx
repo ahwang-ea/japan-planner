@@ -159,7 +159,7 @@ export default function Restaurants() {
   }, [showBookableOnly, showSpotsOpenOnly, filterDateFrom, filterMeals, filterPartySize]);
 
   const effectiveDateFilterKey = effectiveDateFilter
-    ? `${effectiveDateFilter.svd}:${filterDateTo || ''}:${effectiveDateFilter.svt || ''}:${effectiveDateFilter.svps || ''}`
+    ? `${city}:${effectiveDateFilter.svd}:${filterDateTo || ''}:${effectiveDateFilter.svt || ''}:${effectiveDateFilter.svps || ''}`
     : '';
   const dateFilterBrowsedRef = useRef(effectiveDateFilterKey);
 
@@ -259,9 +259,7 @@ export default function Restaurants() {
     setCity(c);
     setBrowsePage(1);
     setSelectedCuisines(new Set());
-    setShowBookableOnly(false);
-    setShowSpotsOpenOnly(false);
-    // Keep date range and meals — user may be checking same trip dates across cities
+    // Keep booking filters, date range, and meals — user may be checking same trip dates across cities
     setAvailabilityMap(new Map());
     setBroadSearch(false);
     setBroadSearchPage(0);
@@ -309,7 +307,10 @@ export default function Restaurants() {
     return parts.some(p => selectedCuisines.has(p));
   };
 
-  const getAvail = (r: TabelogResult) => r.tabelog_url ? availabilityMap.get(r.tabelog_url) : undefined;
+  const getAvail = (r: TabelogResult) => {
+    if (!r.tabelog_url) return undefined;
+    return availabilityMap.get(r.tabelog_url) ?? availabilityMap.get(normalizeUrl(r.tabelog_url));
+  };
 
   const getNearestAvailDate = (r: TabelogResult) => {
     const avail = getAvail(r);
@@ -365,6 +366,8 @@ export default function Restaurants() {
   // When the ranked list is exhausted, automatically expand to broader Tabelog listing
   useEffect(() => {
     if (!isFiltering || filteredResults.length >= MIN_FILTERED || fetchingMore || browseLoading) return;
+    // Don't fetch more browse pages while batch search is streaming — it brings its own restaurants
+    if (batchSearchRunningRef.current) return;
     const needsAvailData = showBookableOnly || showSpotsOpenOnly;
     if (needsAvailData && uncheckedCount > 40) return; // allow loading pages ahead while checks run
 
@@ -387,10 +390,11 @@ export default function Restaurants() {
   useEffect(() => { browse(city, 1); }, []);
 
   // Batch availability search using Tabelog's native date filtering (vac_net=1)
-  // Debounced: waits 600ms after the last filter change before firing
+  // Streams results per-date via NDJSON for progressive UI updates
   const batchSearchRunningRef = useRef(false);
   const batchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Track search config (party size, meal) to decide merge vs replace on response
+  const batchAbortRef = useRef<AbortController | null>(null);
+  // Track search config (party size, meal) to decide merge vs replace on first chunk
   const lastSearchConfigRef = useRef({ svt: '', svps: '', city: '' });
   useEffect(() => {
     // Clear any pending debounce
@@ -403,7 +407,11 @@ export default function Restaurants() {
     }
 
     batchDebounceRef.current = setTimeout(() => {
-      // Capture the key for this search so we can ignore stale responses
+      // Abort any in-flight search
+      if (batchAbortRef.current) batchAbortRef.current.abort();
+      const abortController = new AbortController();
+      batchAbortRef.current = abortController;
+
       const searchKey = effectiveDateFilterKey;
       dateFilterBrowsedRef.current = searchKey;
 
@@ -416,76 +424,122 @@ export default function Restaurants() {
       batchSearchRunningRef.current = true;
       setAvailChecking(true);
 
-      api<{ availableByDate: Record<string, string[]>; restaurants: TabelogResult[]; timeSlots?: Record<string, Record<string, string[]>> }>('/availability/search', {
+      // Decide merge vs replace before first chunk arrives
+      const currentConfig = { svt: effectiveDateFilter?.svt || '', svps: String(effectiveDateFilter?.svps || ''), city };
+      const configChanged = lastSearchConfigRef.current.svt !== currentConfig.svt ||
+                            lastSearchConfigRef.current.svps !== currentConfig.svps ||
+                            lastSearchConfigRef.current.city !== currentConfig.city;
+      lastSearchConfigRef.current = currentConfig;
+      let firstChunk = true;
+
+      // Stream NDJSON response for progressive updates
+      fetch('/api/availability/search', {
         method: 'POST',
-        body: JSON.stringify({
-          city,
-          dates: datesToSearch,
-          meal,
-          partySize: filterPartySize,
-        }),
-      }).then(({ availableByDate, restaurants: searchRestaurants, timeSlots: timeSlotsMap }) => {
-        // Ignore stale response if filters changed while search was running
-        if (dateFilterBrowsedRef.current !== searchKey) {
-          console.log(`[batch-avail] ignoring stale response (filters changed)`);
-          return;
-        }
-        console.log(`[batch-avail] got ${searchRestaurants?.length || 0} unique restaurants, dates: ${Object.entries(availableByDate).map(([d, urls]) => `${d}=${urls.length}`).join(', ')}`);
-        // Merge date-filtered restaurants into allResults (they may not be in the top-rated browse list)
-        if (searchRestaurants?.length) {
-          setAllResults(prev => {
-            const existingUrls = new Set(prev.map(x => x.tabelog_url ? normalizeUrl(x.tabelog_url) : '').filter(Boolean));
-            const newOnes = searchRestaurants.filter(
-              (r: TabelogResult) => r.tabelog_url && !existingUrls.has(normalizeUrl(r.tabelog_url))
-            );
-            return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
-          });
-        }
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ city, dates: datesToSearch, meal, partySize: filterPartySize }),
+        signal: abortController.signal,
+      }).then(async (response) => {
+        if (!response.ok || !response.body) throw new Error('Search request failed');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-        // Decide merge vs replace: if party size or meal changed, replace to avoid stale data.
-        // If only dates changed, merge so restaurants from narrower search aren't lost.
-        const currentConfig = { svt: effectiveDateFilter?.svt || '', svps: String(effectiveDateFilter?.svps || ''), city };
-        const configChanged = lastSearchConfigRef.current.svt !== currentConfig.svt ||
-                              lastSearchConfigRef.current.svps !== currentConfig.svps ||
-                              lastSearchConfigRef.current.city !== currentConfig.city;
-        lastSearchConfigRef.current = currentConfig;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
 
-        setAvailabilityMap(prev => {
-          const next = configChanged ? new Map<string, ReservationAvailability>() : new Map(prev);
-          for (const r of (searchRestaurants || [])) {
-            if (!r.tabelog_url) continue;
-            const normalUrl = normalizeUrl(r.tabelog_url);
-            const dates: ReservationAvailability['dates'] = [];
+          // Process complete lines
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // keep incomplete line in buffer
 
-            for (const [date, urls] of Object.entries(availableByDate)) {
-              const normalizedUrls = new Set(urls.map(u => normalizeUrl(u)));
-              const isAvailable = normalizedUrls.has(normalUrl) || normalizedUrls.has(r.tabelog_url);
-              const slots = timeSlotsMap?.[r.tabelog_url]?.[date] || timeSlotsMap?.[normalUrl]?.[date] || [];
-              dates.push({ date, status: isAvailable ? 'available' : 'unavailable', timeSlots: slots });
-            }
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            if (dateFilterBrowsedRef.current !== searchKey) return; // stale
 
-            if (dates.length > 0) {
-              next.set(r.tabelog_url, {
-                tabelogUrl: normalUrl,
-                hasOnlineReservation: dates.some(d => d.status === 'available'),
-                reservationUrl: null,
-                dates,
-                checkedAt: new Date().toISOString(),
+            const msg = JSON.parse(line);
+
+            if (msg.type === 'date') {
+              const { date, available, restaurants: dateRestaurants, timeSlots: dateTimeSlots } = msg as {
+                date: string;
+                available: string[];
+                restaurants: TabelogResult[];
+                timeSlots: Record<string, string[]>;
+              };
+
+              console.log(`[batch-avail] streamed ${date}: ${available.length} available, ${dateRestaurants.length} new restaurants`);
+
+              // Merge new restaurants into allResults
+              if (dateRestaurants.length > 0) {
+                setAllResults(prev => {
+                  const existingUrls = new Set(prev.map(x => x.tabelog_url ? normalizeUrl(x.tabelog_url) : '').filter(Boolean));
+                  const newOnes = dateRestaurants.filter(
+                    (r: TabelogResult) => r.tabelog_url && !existingUrls.has(normalizeUrl(r.tabelog_url))
+                  );
+                  return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
+                });
+              }
+
+              // Update availability map incrementally
+              setAvailabilityMap(prev => {
+                const next = (firstChunk && configChanged) ? new Map<string, ReservationAvailability>() : new Map(prev);
+                firstChunk = false;
+                const availableNorm = new Set(available.map(u => normalizeUrl(u)));
+
+                // Update every known restaurant with this date's status
+                // (restaurants from both browse and search results)
+                const allKnownUrls = new Set([
+                  ...available,
+                  ...Array.from(prev.keys()),
+                ]);
+                for (const url of allKnownUrls) {
+                  const normalUrl = normalizeUrl(url);
+                  const isAvailable = availableNorm.has(normalUrl);
+                  const slots = dateTimeSlots[url] || dateTimeSlots[normalUrl] || [];
+                  const existing = next.get(normalUrl);
+                  const newDateEntry = { date, status: (isAvailable ? 'available' : 'unavailable') as 'available' | 'unavailable', timeSlots: slots };
+
+                  if (existing) {
+                    // Add or update this date in existing entry
+                    const otherDates = existing.dates.filter(d => d.date !== date);
+                    const updatedDates = [...otherDates, newDateEntry];
+                    next.set(normalUrl, {
+                      ...existing,
+                      hasOnlineReservation: existing.hasOnlineReservation || isAvailable,
+                      dates: updatedDates,
+                    });
+                  } else if (isAvailable) {
+                    next.set(normalUrl, {
+                      tabelogUrl: normalUrl,
+                      hasOnlineReservation: true,
+                      reservationUrl: null,
+                      dates: [newDateEntry],
+                      checkedAt: new Date().toISOString(),
+                    });
+                  }
+                }
+                return next;
               });
+            } else if (msg.type === 'done') {
+              console.log(`[batch-avail] stream done: ${msg.totalRestaurants} total restaurants`);
             }
           }
-          return next;
-        });
+        }
       }).catch(err => {
-        console.error('[batch-avail] search failed:', err);
+        if (err.name === 'AbortError') {
+          console.log('[batch-avail] search aborted');
+        } else {
+          console.error('[batch-avail] search failed:', err);
+        }
       }).finally(() => {
         batchSearchRunningRef.current = false;
         setAvailChecking(false);
       });
-    }, 600);
+    }, 200); // reduced debounce — SmartDateInput already confirms on Enter/blur
 
     return () => {
       if (batchDebounceRef.current) clearTimeout(batchDebounceRef.current);
+      if (batchAbortRef.current) batchAbortRef.current.abort();
     };
   }, [effectiveDateFilterKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -504,7 +558,7 @@ export default function Restaurants() {
             method: 'POST',
             body: JSON.stringify({ tabelog_url: url, dateFrom: filterDateFrom || undefined, dateTo: filterDateTo || undefined, meals: filterMeals.size > 0 ? [...filterMeals] : undefined, partySize: filterPartySize || undefined }),
           });
-          setAvailabilityMap(prev => new Map(prev).set(url, result));
+          setAvailabilityMap(prev => new Map(prev).set(normalizeUrl(url), result));
         } catch { /* failed */ }
       }));
     }
@@ -866,46 +920,9 @@ export default function Restaurants() {
                 </div>
               )}
 
-              {/* Availability filters */}
-              {!browseLoading && (browseResults.length > 0 || allResults.length > 0) && (
-                <div className="mb-4 flex items-center gap-2">
-                  <span className="text-xs font-medium text-gray-500 uppercase mr-1">Booking:</span>
-                  <button
-                    onClick={() => { setShowBookableOnly(v => !v); if (!showBookableOnly) setShowSpotsOpenOnly(false); }}
-                    className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
-                      showBookableOnly
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
-                    }`}
-                  >
-                    Bookable Online
-                  </button>
-                  <button
-                    onClick={() => { setShowSpotsOpenOnly(v => !v); if (!showSpotsOpenOnly) setShowBookableOnly(false); }}
-                    className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
-                      showSpotsOpenOnly
-                        ? 'bg-green-600 text-white'
-                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
-                    }`}
-                  >
-                    <span>◯</span> Spots Open
-                  </button>
-                  {availChecking && (() => {
-                    const totalToCheck = (isFiltering ? allResults : browseResults).length;
-                    return (
-                      <span className="text-xs text-gray-400 flex items-center gap-1.5">
-                        <span className="inline-block w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
-                        Checking availability ({availabilityMap.size}/{totalToCheck})
-                      </span>
-                    );
-                  })()}
-                </div>
-              )}
-
-              {/* Date range & meal filter — shown when booking filters are active */}
-              {(showBookableOnly || showSpotsOpenOnly) && !browseLoading && (
-                <div className="mb-4 flex items-center gap-2 flex-wrap">
-                  <span className="text-xs font-medium text-gray-500 uppercase mr-1">When:</span>
+              {/* Date range & booking filters — always visible so dates can be entered before results load */}
+              <div className="mb-4 flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-medium text-gray-500 uppercase mr-1">When:</span>
                   <div className="w-40">
                     <SmartDateInput
                       value={filterDateFrom}
@@ -991,6 +1008,41 @@ export default function Restaurants() {
                       <option key={n} value={n}>{n} {n === 1 ? 'guest' : 'guests'}</option>
                     ))}
                   </select>
+                </div>
+
+              {/* Availability filters */}
+              {(browseResults.length > 0 || allResults.length > 0) && (
+                <div className="mb-4 flex items-center gap-2">
+                  <span className="text-xs font-medium text-gray-500 uppercase mr-1">Booking:</span>
+                  <button
+                    onClick={() => { setShowBookableOnly(v => !v); if (!showBookableOnly) setShowSpotsOpenOnly(false); }}
+                    className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
+                      showBookableOnly
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    Bookable Online
+                  </button>
+                  <button
+                    onClick={() => { setShowSpotsOpenOnly(v => !v); if (!showSpotsOpenOnly) setShowBookableOnly(false); }}
+                    className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
+                      showSpotsOpenOnly
+                        ? 'bg-green-600 text-white'
+                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    <span>◯</span> Spots Open
+                  </button>
+                  {availChecking && (() => {
+                    const totalToCheck = (isFiltering ? allResults : browseResults).length;
+                    return (
+                      <span className="text-xs text-gray-400 flex items-center gap-1.5">
+                        <span className="inline-block w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                        Checking availability ({availabilityMap.size}/{totalToCheck})
+                      </span>
+                    );
+                  })()}
                 </div>
               )}
 
