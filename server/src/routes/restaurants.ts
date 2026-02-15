@@ -26,7 +26,12 @@ restaurantsRouter.get('/browse', async (req, res) => {
     }
 
     const refresh = req.query.refresh === 'true';
-    const result = await browseTabelog(city, page, refresh);
+    const sort = typeof req.query.sort === 'string' ? req.query.sort : 'rt';
+    const svd = req.query.svd as string | undefined;
+    const svt = req.query.svt as string | undefined;
+    const svps = req.query.svps ? parseInt(req.query.svps as string) : undefined;
+    const dateFilter = svd ? { date: svd, time: svt, partySize: svps } : undefined;
+    const result = await browseTabelog(city, page, refresh, sort, dateFilter);
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: 'Failed to browse Tabelog', details: String(error) });

@@ -4,7 +4,7 @@ import path from 'path';
 
 let browser: Browser | null = null;
 
-async function getBrowser(): Promise<Browser> {
+export async function getBrowser(): Promise<Browser> {
   if (!browser || !browser.isConnected()) {
     browser = await chromium.launch({
       headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
@@ -13,7 +13,7 @@ async function getBrowser(): Promise<Browser> {
   return browser;
 }
 
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+export const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 export interface TabelogData {
   name: string | null;
@@ -28,12 +28,17 @@ export interface TabelogData {
   price_range: string | null;
   hours: string | null;
   image_url: string | null;
+  has_online_reservation?: boolean;
+  reservation_url?: string | null;
+  time_slots?: string[];
 }
 
 export interface TabelogListResult {
   restaurants: TabelogData[];
   page: number;
   hasNextPage: boolean;
+  dateFiltered?: boolean;   // true when results are pre-filtered by Tabelog for date availability
+  filteredDate?: string;    // YYYY-MM-DD date used for filtering
 }
 
 export const TABELOG_CITIES: Record<string, string> = {
@@ -92,20 +97,39 @@ async function textOf(page: Page, selector: string, parent?: string): Promise<st
  * Browse Tabelog ranking page for a city, sorted by score.
  * Uses Playwright locators (server-side) to avoid tsx/evaluate issues.
  */
-export async function browseTabelog(city: string, page: number = 1, refresh: boolean = false): Promise<TabelogListResult> {
-  const cacheKey = `${city.toLowerCase()}:${page}`;
+export async function browseTabelog(
+  city: string,
+  page: number = 1,
+  refresh: boolean = false,
+  sort: string = 'rt',
+  dateFilter?: { date?: string; time?: string; partySize?: number },
+): Promise<TabelogListResult> {
+  const dateFilterKey = dateFilter?.date ? `:${dateFilter.date}:${dateFilter.time || ''}:${dateFilter.partySize || ''}` : '';
+  const cacheKey = `${city.toLowerCase()}:${page}:${sort}${dateFilterKey}`;
   if (!refresh) {
     const cached = browseCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      console.log(`  [browse] CACHE HIT key=${cacheKey} (${cached.data.restaurants.length} restaurants)`);
       return cached.data;
     }
   }
 
   const citySlug = TABELOG_CITIES[city.toLowerCase()] || city.toLowerCase();
+  const params = new URLSearchParams();
+  if (sort === 'rt') params.set('SrtT', 'rt');
+  if (dateFilter?.date) {
+    params.set('svd', dateFilter.date.replace(/-/g, ''));
+    params.set('vac_net', '1'); // filter to restaurants with vacancy for online reservation
+  }
+  if (dateFilter?.time) params.set('svt', dateFilter.time);
+  if (dateFilter?.partySize) params.set('svps', String(dateFilter.partySize));
+  const queryStr = params.toString() ? `?${params.toString()}` : '';
+  // Use English site for readable names; reservation detection uses HTTP pre-check separately
   const url = page === 1
-    ? `https://tabelog.com/en/${citySlug}/rstLst/?SrtT=rt`
-    : `https://tabelog.com/en/${citySlug}/rstLst/${page}/?SrtT=rt`;
+    ? `https://tabelog.com/en/${citySlug}/rstLst/${queryStr}`
+    : `https://tabelog.com/en/${citySlug}/rstLst/${page}/${queryStr}`;
 
+  console.log(`  [browse] FETCH ${url}`);
   const b = await getBrowser();
   const context = await b.newContext({ userAgent: UA });
   const pageObj = await context.newPage();
@@ -188,10 +212,50 @@ export async function browseTabelog(city: string, page: number = 1, refresh: boo
         }
       } catch { /* no image */ }
 
+      // Inline reservation availability from listing page
+      let hasOnlineReservation = false;
+      let reservationUrl: string | null = null;
+      try {
+        const yoyakuLink = item.locator('a[href*="yoyaku.tabelog.com"]').first();
+        const href = await yoyakuLink.getAttribute('href', { timeout: 300 });
+        if (href) {
+          hasOnlineReservation = true;
+          reservationUrl = href;
+        }
+      } catch { /* no reservation link */ }
+      if (!hasOnlineReservation) {
+        try {
+          // Check for "Online Booking" text (English site) or ネット予約 (Japanese site)
+          const bookingText = await item.locator('text=/Online Booking|ネット予約/i').count();
+          if (bookingText > 0) hasOnlineReservation = true;
+        } catch { /* skip */ }
+      }
+
+      // Extract available time slots from booking links (vac_net=1 pages)
+      const timeSlots: string[] = [];
+      if (dateFilter?.date) {
+        try {
+          const bookingLinks = item.locator('a[href*="booking/form_course"]');
+          const linkCount = await bookingLinks.count();
+          for (let j = 0; j < linkCount; j++) {
+            const href = await bookingLinks.nth(j).getAttribute('href', { timeout: 300 });
+            const timeMatch = href?.match(/visit_time=(\d{4})/);
+            if (timeMatch) {
+              const t = timeMatch[1];
+              const formatted = `${t.slice(0, 2)}:${t.slice(2, 4)}`;
+              if (!timeSlots.includes(formatted)) timeSlots.push(formatted);
+            }
+          }
+        } catch { /* no booking links */ }
+      }
+
       const entry: TabelogData = {
         name, name_ja: null, tabelog_url: tabelogUrl, tabelog_score: score,
         cuisine, area, city, address: null, phone: null,
         price_range: priceRange, hours: null, image_url: imageUrl,
+        has_online_reservation: dateFilter?.date ? true : hasOnlineReservation,
+        reservation_url: reservationUrl,
+        time_slots: timeSlots.length > 0 ? timeSlots : undefined,
       };
 
       // Dedup: keep the entry with the best data
@@ -209,17 +273,28 @@ export async function browseTabelog(city: string, page: number = 1, refresh: boo
       }
     }
 
+    const hasDateFilter = !!dateFilter?.date;
+    const bookableCount = Array.from(seenUrls.values()).filter(r => r.has_online_reservation).length;
+    console.log(`  [browse] ${citySlug} p${page} sort=${sort}${hasDateFilter ? ` date=${dateFilter.date} vac_net=1` : ''}: ${seenUrls.size} restaurants, ${bookableCount} bookable online`);
+
     // Check for next page
     const nextLink = pageObj.locator('a.c-pagination__arrow--next').first();
     let hasNextPage = false;
     try {
       hasNextPage = await nextLink.isVisible({ timeout: 500 });
     } catch { /* no next */ }
-
+    // Normalize date to YYYY-MM-DD for consistency with availability dates
+    const normalizedDate = hasDateFilter && dateFilter.date
+      ? (dateFilter.date.length === 8
+        ? `${dateFilter.date.slice(0,4)}-${dateFilter.date.slice(4,6)}-${dateFilter.date.slice(6,8)}`
+        : dateFilter.date)
+      : undefined;
     const result: TabelogListResult = {
       restaurants: Array.from(seenUrls.values()),
       page,
       hasNextPage,
+      dateFiltered: hasDateFilter || undefined,
+      filteredDate: normalizedDate,
     };
 
     browseCache.set(cacheKey, { data: result, timestamp: Date.now() });
