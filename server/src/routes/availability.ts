@@ -86,8 +86,7 @@ availabilityRouter.post('/check-batch', async (req, res) => {
 });
 
 // Batch availability search using Tabelog's native date filtering
-// Instead of checking each restaurant individually, search Tabelog with date params
-// and return which restaurant URLs are available per date
+// Streams results per-date as newline-delimited JSON so the client can show progress
 availabilityRouter.post('/search', async (req, res) => {
   const { city, dates, meal, partySize } = req.body;
   if (!city || !dates?.length) {
@@ -95,24 +94,36 @@ availabilityRouter.post('/search', async (req, res) => {
     return;
   }
 
+  // Set up streaming response (newline-delimited JSON)
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering if proxied
+  res.flushHeaders();
+
+  // Track client disconnection via event — req.destroyed is unreliable after express.json()
+  // parses the body (the request stream is consumed, so destroyed becomes true)
+  let clientGone = false;
+  res.on('close', () => { clientGone = true; });
+
   try {
     const { browseTabelog } = await import('../lib/scrapers/tabelog.js');
     // svt (time) is REQUIRED for vac_net=1 to actually filter — without it Tabelog returns all restaurants
     const time = meal === 'lunch' ? '1200' : '1900';
     const MAX_PAGES_PER_DATE = 5;
+    const allRestaurants = new Map<string, Awaited<ReturnType<typeof browseTabelog>>['restaurants'][0]>();
 
     console.log(`[avail-search] city=${city} dates=${dates.join(',')} meal=${meal || 'any'} party=${partySize || 'any'}`);
 
-    // Search each date in parallel, pages sequential per date
-    // Collect unique restaurants across all dates for merging into browse list
-    const availableByDate: Record<string, string[]> = {};
-    const allRestaurants = new Map<string, Awaited<ReturnType<typeof browseTabelog>>['restaurants'][0]>();
-    // Time slots per restaurant per date (url → { date → string[] })
-    const timeSlotsMap: Record<string, Record<string, string[]>> = {};
-
+    // Search each date in parallel, stream results as each date completes
     await Promise.all((dates as string[]).slice(0, 14).map(async (date: string) => {
+      if (clientGone) return;
+
       const available: string[] = [];
+      const dateTimeSlots: Record<string, string[]> = {};
+      const dateRestaurants: Awaited<ReturnType<typeof browseTabelog>>['restaurants'][0][] = [];
+
       for (let p = 1; p <= MAX_PAGES_PER_DATE; p++) {
+        if (clientGone) return;
         const result = await browseTabelog(city, p, false, 'rt', {
           date,
           time,
@@ -121,23 +132,44 @@ availabilityRouter.post('/search', async (req, res) => {
         for (const r of result.restaurants) {
           if (r.tabelog_url) {
             available.push(r.tabelog_url);
-            if (!allRestaurants.has(r.tabelog_url)) allRestaurants.set(r.tabelog_url, r);
+            if (!allRestaurants.has(r.tabelog_url)) {
+              allRestaurants.set(r.tabelog_url, r);
+              dateRestaurants.push(r);
+            }
             if (r.time_slots?.length) {
-              if (!timeSlotsMap[r.tabelog_url]) timeSlotsMap[r.tabelog_url] = {};
-              timeSlotsMap[r.tabelog_url][date] = r.time_slots;
+              dateTimeSlots[r.tabelog_url] = r.time_slots;
             }
           }
         }
         if (!result.hasNextPage) break;
       }
-      availableByDate[date] = available;
+
       console.log(`[avail-search]   ${date}: ${available.length} available`);
+
+      // Stream this date's results immediately
+      if (!clientGone) {
+        res.write(JSON.stringify({
+          type: 'date',
+          date,
+          available,
+          restaurants: dateRestaurants,
+          timeSlots: dateTimeSlots,
+        }) + '\n');
+      }
     }));
 
     console.log(`[avail-search] total unique restaurants: ${allRestaurants.size}`);
-    res.json({ availableByDate, restaurants: Array.from(allRestaurants.values()), timeSlots: timeSlotsMap });
+    if (!clientGone) {
+      res.write(JSON.stringify({ type: 'done', totalRestaurants: allRestaurants.size }) + '\n');
+    }
+    res.end();
   } catch (error) {
     console.error('[avail-search] failed', error);
-    res.status(500).json({ error: 'Availability search failed', details: String(error) });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Availability search failed', details: String(error) });
+    } else if (!clientGone) {
+      res.write(JSON.stringify({ type: 'error', error: String(error) }) + '\n');
+      res.end();
+    }
   }
 });
