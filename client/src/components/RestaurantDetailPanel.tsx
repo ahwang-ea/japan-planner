@@ -1,4 +1,15 @@
+import { useEffect, useState, useRef } from 'react';
 import type { Restaurant, TabelogResult } from '../pages/Restaurants';
+import { api } from '../lib/api';
+
+interface ReservationAvailability {
+  tabelogUrl: string;
+  hasOnlineReservation: boolean;
+  reservationUrl: string | null;
+  dates: { date: string; status: 'available' | 'limited' | 'unavailable' | 'unknown'; timeSlots: string[] }[];
+  checkedAt: string;
+  error?: string;
+}
 
 interface Props {
   restaurant: Restaurant | TabelogResult;
@@ -11,6 +22,11 @@ interface Props {
   hasPrev: boolean;
   hasNext: boolean;
   favoriteAnimating?: boolean;
+  availability?: ReservationAvailability | null;
+  filterDateFrom?: string;
+  filterDateTo?: string;
+  filterMeals?: Set<'lunch' | 'dinner'>;
+  filterPartySize?: number;
 }
 
 function isSavedRestaurant(r: Restaurant | TabelogResult): r is Restaurant {
@@ -28,8 +44,43 @@ export default function RestaurantDetailPanel({
   hasPrev,
   hasNext,
   favoriteAnimating,
+  availability: externalAvailability,
+  filterDateFrom,
+  filterDateTo,
+  filterMeals,
+  filterPartySize,
 }: Props) {
   const saved = isSavedRestaurant(r) ? r : null;
+  const [availability, setAvailability] = useState<ReservationAvailability | null>(externalAvailability ?? null);
+  const [loadingAvail, setLoadingAvail] = useState(false);
+  const fetchedUrlRef = useRef<string | null>(null);
+
+  // Auto-fetch availability when panel opens or restaurant changes
+  useEffect(() => {
+    if (externalAvailability) {
+      setAvailability(externalAvailability);
+      return;
+    }
+    const url = r.tabelog_url;
+    if (!url || fetchedUrlRef.current === url) return;
+    fetchedUrlRef.current = url;
+    setLoadingAvail(true);
+    api<ReservationAvailability>('/availability/check', {
+      method: 'POST',
+      body: JSON.stringify({ tabelog_url: url, dateFrom: filterDateFrom || undefined, dateTo: filterDateTo || undefined, meals: filterMeals && filterMeals.size > 0 ? [...filterMeals] : undefined, partySize: filterPartySize || undefined }),
+    })
+      .then(setAvailability)
+      .catch(() => setAvailability(null))
+      .finally(() => setLoadingAvail(false));
+  }, [r.tabelog_url, externalAvailability, filterDateFrom, filterDateTo, filterMeals, filterPartySize]);
+
+  // Reset when restaurant changes
+  useEffect(() => {
+    if (!externalAvailability) {
+      setAvailability(null);
+      fetchedUrlRef.current = null;
+    }
+  }, [r.tabelog_url]);
 
   const scoreColor = (score: number | null) =>
     !score ? 'text-gray-400' :
@@ -43,6 +94,30 @@ export default function RestaurantDetailPanel({
     { label: 'TableCheck', url: saved.tablecheck_url },
     { label: 'TableAll', url: saved.tableall_url },
   ].filter(p => p.url) : r.tabelog_url ? [{ label: 'Tabelog', url: r.tabelog_url }] : [];
+
+  const formatCheckedAt = (iso: string) => {
+    const diff = Date.now() - new Date(iso).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    return `${hrs}h ago`;
+  };
+
+  // Get the best reserve link — prefer the Japanese restaurant page (has embedded booking calendar)
+  // over scraped yoyaku URLs that may point to broken endpoints like send_remind
+  const getReserveUrl = () => {
+    return availability?.tabelogUrl || r.tabelog_url?.replace('tabelog.com/en/', 'tabelog.com/') || r.tabelog_url || '#';
+  };
+
+  const statusSymbol = (s: string) => {
+    switch (s) {
+      case 'available': return { symbol: '◯', color: 'text-green-600 bg-green-50 border-green-200' };
+      case 'limited': return { symbol: '△', color: 'text-yellow-600 bg-yellow-50 border-yellow-200' };
+      case 'unavailable': return { symbol: '✕', color: 'text-red-500 bg-red-50 border-red-200' };
+      default: return { symbol: '?', color: 'text-gray-400 bg-gray-50 border-gray-200' };
+    }
+  };
 
   return (
     <div className="flex flex-col h-full">
@@ -150,6 +225,75 @@ export default function RestaurantDetailPanel({
                     </a>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/* Reservation Availability */}
+            {r.tabelog_url && (
+              <div className="mt-6">
+                <h3 className="text-sm font-medium text-gray-700 mb-2">Tabelog Reservation</h3>
+                {loadingAvail ? (
+                  <div className="flex items-center gap-2 text-sm text-gray-400">
+                    <span className="inline-block w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+                    Checking availability on Japanese site...
+                  </div>
+                ) : availability ? (
+                  <div>
+                    {availability.hasOnlineReservation ? (
+                      <div>
+                        <span className="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-green-50 text-green-700 border border-green-200">
+                          Online booking available
+                        </span>
+                        {availability.hasOnlineReservation && (
+                          <a
+                            href={getReserveUrl()}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="ml-2 inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100"
+                          >
+                            Reserve on Tabelog &rarr;
+                          </a>
+                        )}
+                        {availability.dates.length > 0 && (
+                          <div className="mt-3 flex gap-1.5 flex-wrap">
+                            {availability.dates.map(d => {
+                              const { symbol, color } = statusSymbol(d.status);
+                              const dateLabel = new Date(d.date + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+                              return (
+                                <div
+                                  key={d.date}
+                                  className={`px-2 py-1.5 rounded border text-xs ${color}`}
+                                  title={d.timeSlots.length > 0 ? `Available: ${d.timeSlots.join(', ')}` : undefined}
+                                >
+                                  <div className="font-medium text-center">{dateLabel}</div>
+                                  <div className="text-center text-sm">{symbol}</div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <span className="inline-flex items-center px-2.5 py-1 rounded-md text-xs font-medium bg-gray-100 text-gray-500 border border-gray-200">
+                        No online booking
+                      </span>
+                    )}
+                    <p className="text-xs text-gray-400 mt-2">
+                      Checked {formatCheckedAt(availability.checkedAt)}
+                      {' '}
+                      <a
+                        href={availability.tabelogUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-blue-400 hover:text-blue-600"
+                      >
+                        View JP page
+                      </a>
+                    </p>
+                  </div>
+                ) : (
+                  <span className="text-xs text-gray-400">Unable to check availability</span>
+                )}
               </div>
             )}
 

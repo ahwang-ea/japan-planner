@@ -1,8 +1,17 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../lib/api';
 import { format } from 'date-fns';
 import type { Restaurant } from '../pages/Restaurants';
+
+interface ReservationAvailability {
+  tabelogUrl: string;
+  hasOnlineReservation: boolean;
+  reservationUrl: string | null;
+  dates: { date: string; status: string; timeSlots: string[] }[];
+  checkedAt: string;
+  error?: string;
+}
 
 interface TripRestaurant extends Restaurant {
   sort_order: number;
@@ -47,6 +56,9 @@ export default function TripDetailPanel({
   const [trip, setTrip] = useState<TripDetail | null>(null);
   const [allRestaurants, setAllRestaurants] = useState<Restaurant[]>([]);
   const [selectedRestaurant, setSelectedRestaurant] = useState('');
+  const [availMap, setAvailMap] = useState<Map<string, ReservationAvailability>>(new Map());
+  const [checkingAvail, setCheckingAvail] = useState(false);
+  const availAbortRef = useRef<AbortController | null>(null);
 
   const load = () => {
     api<TripDetail>(`/trips/${tripId}`).then(setTrip);
@@ -54,6 +66,44 @@ export default function TripDetailPanel({
   };
 
   useEffect(() => { load(); }, [tripId]);
+
+  // Auto-check availability for all trip restaurants
+  useEffect(() => {
+    if (!trip || trip.restaurants.length === 0) return;
+    const urls = trip.restaurants
+      .map(r => r.tabelog_url)
+      .filter((u): u is string => !!u && !availMap.has(u));
+    if (urls.length === 0) return;
+
+    availAbortRef.current?.abort();
+    const abort = new AbortController();
+    availAbortRef.current = abort;
+
+    setCheckingAvail(true);
+    const CONCURRENCY = 3;
+    (async () => {
+      for (let i = 0; i < urls.length; i += CONCURRENCY) {
+        if (abort.signal.aborted) break;
+        const batch = urls.slice(i, i + CONCURRENCY);
+        await Promise.all(batch.map(async (url) => {
+          if (abort.signal.aborted) return;
+          try {
+            const result = await api<ReservationAvailability>('/availability/check', {
+              method: 'POST',
+              body: JSON.stringify({ tabelog_url: url }),
+              signal: abort.signal,
+            });
+            if (!abort.signal.aborted) {
+              setAvailMap(prev => new Map(prev).set(url, result));
+            }
+          } catch { /* aborted or failed */ }
+        }));
+      }
+      if (!abort.signal.aborted) setCheckingAvail(false);
+    })();
+
+    return () => { abort.abort(); };
+  }, [trip?.restaurants.length, tripId]);
 
   const addRestaurant = async () => {
     if (!selectedRestaurant) return;
@@ -135,16 +185,24 @@ export default function TripDetailPanel({
                     {trip.city && <span className="ml-2">({trip.city})</span>}
                   </p>
                 </div>
-                <button
-                  onClick={onActivate}
-                  className={`px-3 py-1.5 text-xs font-medium rounded-md ${
-                    isActive
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                  }`}
-                >
-                  {isActive ? 'Active' : 'Set Active'}
-                </button>
+                <div className="flex items-center gap-2">
+                  {checkingAvail && (
+                    <span className="text-xs text-gray-400 flex items-center gap-1">
+                      <span className="inline-block w-3 h-3 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+                      Checking
+                    </span>
+                  )}
+                  <button
+                    onClick={onActivate}
+                    className={`px-3 py-1.5 text-xs font-medium rounded-md ${
+                      isActive
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
+                    }`}
+                  >
+                    {isActive ? 'Active' : 'Set Active'}
+                  </button>
+                </div>
               </div>
               {trip.notes && <p className="mt-3 text-sm text-gray-600">{trip.notes}</p>}
             </div>
@@ -216,7 +274,7 @@ export default function TripDetailPanel({
                             <div className="mb-2">
                               <span className="text-xs text-amber-600 font-medium">Lunch</span>
                               {lunch.map(r => (
-                                <RestaurantRow key={r.id} r={r} scoreColor={scoreColor} onRemove={removeRestaurant} />
+                                <RestaurantRow key={r.id} r={r} scoreColor={scoreColor} onRemove={removeRestaurant} availability={r.tabelog_url ? availMap.get(r.tabelog_url) : undefined} />
                               ))}
                             </div>
                           )}
@@ -224,12 +282,12 @@ export default function TripDetailPanel({
                             <div className="mb-2">
                               <span className="text-xs text-indigo-600 font-medium">Dinner</span>
                               {dinner.map(r => (
-                                <RestaurantRow key={r.id} r={r} scoreColor={scoreColor} onRemove={removeRestaurant} />
+                                <RestaurantRow key={r.id} r={r} scoreColor={scoreColor} onRemove={removeRestaurant} availability={r.tabelog_url ? availMap.get(r.tabelog_url) : undefined} />
                               ))}
                             </div>
                           )}
                           {other.map(r => (
-                            <RestaurantRow key={r.id} r={r} scoreColor={scoreColor} onRemove={removeRestaurant} />
+                            <RestaurantRow key={r.id} r={r} scoreColor={scoreColor} onRemove={removeRestaurant} availability={r.tabelog_url ? availMap.get(r.tabelog_url) : undefined} />
                           ))}
                         </div>
                       );
@@ -238,7 +296,7 @@ export default function TripDetailPanel({
                       <div className="px-4 py-3">
                         <div className="text-xs font-semibold text-gray-400 uppercase mb-2">Unscheduled</div>
                         {unscheduled.map(r => (
-                          <RestaurantRow key={r.id} r={r} scoreColor={scoreColor} onRemove={removeRestaurant} />
+                          <RestaurantRow key={r.id} r={r} scoreColor={scoreColor} onRemove={removeRestaurant} availability={r.tabelog_url ? availMap.get(r.tabelog_url) : undefined} />
                         ))}
                       </div>
                     )}
@@ -263,10 +321,12 @@ function RestaurantRow({
   r,
   scoreColor,
   onRemove,
+  availability,
 }: {
   r: { id: string; name: string; name_ja?: string | null; image_url: string | null; tabelog_score: number | null; cuisine: string | null; area: string | null; is_favorite: number };
   scoreColor: (s: number | null) => string;
   onRemove: (id: string) => void;
+  availability?: ReservationAvailability;
 }) {
   return (
     <div className="flex items-center justify-between py-1.5 hover:bg-gray-50 rounded">
@@ -276,13 +336,20 @@ function RestaurantRow({
             onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }} />
         )}
         <div>
-          <Link
-            to={`/restaurants/${r.id}`}
-            className="text-sm font-medium text-blue-600 hover:text-blue-800"
-          >
-            {r.is_favorite ? <span className="text-amber-400 mr-1">★</span> : null}
-            {r.name}
-          </Link>
+          <div className="flex items-center gap-1.5">
+            <Link
+              to={`/restaurants/${r.id}`}
+              className="text-sm font-medium text-blue-600 hover:text-blue-800"
+            >
+              {r.is_favorite ? <span className="text-amber-400 mr-1">★</span> : null}
+              {r.name}
+            </Link>
+            {availability && (
+              availability.hasOnlineReservation
+                ? <span className="text-green-600 text-xs" title="Online reservation available">◯</span>
+                : <span className="text-gray-400 text-xs" title="No online reservation">✕</span>
+            )}
+          </div>
           <div className="flex gap-2 mt-0.5">
             {r.tabelog_score && (
               <span className={`text-xs font-semibold ${scoreColor(r.tabelog_score)}`}>
