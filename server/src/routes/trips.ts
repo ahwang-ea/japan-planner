@@ -19,11 +19,11 @@ tripsRouter.get('/:id', (req, res) => {
   }
 
   const restaurants = db.prepare(`
-    SELECT r.*, tr.sort_order, tr.day_assigned, tr.notes as trip_notes, tr.id as trip_restaurant_id
+    SELECT r.*, tr.sort_order, tr.day_assigned, tr.meal, tr.notes as trip_notes, tr.id as trip_restaurant_id
     FROM trip_restaurants tr
     JOIN restaurants r ON r.id = tr.restaurant_id
     WHERE tr.trip_id = ?
-    ORDER BY tr.sort_order ASC, r.tabelog_score DESC
+    ORDER BY tr.day_assigned ASC, tr.meal ASC, tr.sort_order ASC
   `).all(req.params.id);
 
   res.json({ ...trip, restaurants });
@@ -87,7 +87,7 @@ tripsRouter.delete('/:id', (req, res) => {
 
 // Add restaurant to trip
 tripsRouter.post('/:id/restaurants', (req, res) => {
-  const { restaurant_id } = req.body;
+  const { restaurant_id, day_assigned, meal } = req.body;
   if (!restaurant_id) {
     res.status(400).json({ error: 'restaurant_id is required' });
     return;
@@ -108,12 +108,17 @@ tripsRouter.post('/:id/restaurants', (req, res) => {
 
   try {
     db.prepare(`
-      INSERT INTO trip_restaurants (id, trip_id, restaurant_id, sort_order)
-      VALUES (?, ?, ?, ?)
-    `).run(id, req.params.id, restaurant_id, sortOrder);
+      INSERT INTO trip_restaurants (id, trip_id, restaurant_id, sort_order, day_assigned, meal)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, req.params.id, restaurant_id, sortOrder, day_assigned || null, meal || null);
   } catch (e: unknown) {
     if (e instanceof Error && e.message.includes('UNIQUE')) {
-      res.status(409).json({ error: 'Restaurant already in this trip' });
+      // Restaurant already in trip — update the day/meal instead
+      db.prepare(`
+        UPDATE trip_restaurants SET day_assigned = ?, meal = ?
+        WHERE trip_id = ? AND restaurant_id = ?
+      `).run(day_assigned || null, meal || null, req.params.id, restaurant_id);
+      res.json({ success: true, updated: true });
       return;
     }
     throw e;

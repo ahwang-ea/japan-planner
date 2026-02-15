@@ -121,7 +121,7 @@ export default function TripDetail() {
                   <span className="text-sm text-gray-400 w-6 text-center">{idx + 1}</span>
                   <div>
                     <Link to={`/restaurants/${r.id}`} className="text-sm font-medium text-blue-600 hover:text-blue-800">
-                      {r.name}
+                      {r.is_favorite ? <span className="text-amber-400 mr-1">★</span> : null}{r.name}
                     </Link>
                     <div className="flex gap-2 mt-0.5">
                       {r.tabelog_score && (

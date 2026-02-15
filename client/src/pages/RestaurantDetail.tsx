@@ -1,15 +1,39 @@
 import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { api } from '../lib/api';
+import { isInputFocused } from '../lib/keyboard';
 import type { Restaurant } from './Restaurants';
 
 export default function RestaurantDetail() {
   const { id } = useParams<{ id: string }>();
   const [restaurant, setRestaurant] = useState<Restaurant | null>(null);
 
-  useEffect(() => {
+  const load = () => {
     if (id) api<Restaurant>(`/restaurants/${id}`).then(setRestaurant);
-  }, [id]);
+  };
+
+  useEffect(() => { load(); }, [id]);
+
+  const toggleFavorite = async () => {
+    if (!id) return;
+    await api(`/restaurants/${id}/favorite`, { method: 'PATCH' });
+    load();
+  };
+
+  // 'f' key to toggle favorite
+  useEffect(() => {
+    if (!restaurant) return;
+    const handler = (e: KeyboardEvent) => {
+      if (isInputFocused()) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === 'f') {
+        e.preventDefault();
+        toggleFavorite();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [restaurant, id]);
 
   if (!restaurant) return <p className="text-gray-500">Loading...</p>;
 
@@ -26,11 +50,32 @@ export default function RestaurantDetail() {
         &larr; Back to restaurants
       </Link>
 
-      <div className="bg-white rounded-lg border border-gray-200 p-6">
+      <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+        {restaurant.image_url && (
+          <img
+            src={restaurant.image_url}
+            alt={restaurant.name}
+            className="w-full h-48 object-cover"
+            onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
+          />
+        )}
+        <div className="p-6">
         <div className="flex items-start justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">{restaurant.name}</h1>
-            {restaurant.name_ja && <p className="text-gray-500 mt-1">{restaurant.name_ja}</p>}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={toggleFavorite}
+              className={`text-2xl leading-none ${restaurant.is_favorite ? 'text-amber-400' : 'text-gray-300 hover:text-amber-300'}`}
+              aria-label={restaurant.is_favorite ? 'Remove from favorites' : 'Add to favorites'}
+            >
+              {restaurant.is_favorite ? '★' : '☆'}
+            </button>
+            <div>
+              <h1 className="text-2xl font-bold text-gray-900">{restaurant.name}</h1>
+              {restaurant.name_ja && <p className="text-gray-500 mt-1">{restaurant.name_ja}</p>}
+              <span className="text-xs text-gray-400 mt-1 inline-block">
+                Press <kbd className="px-1 py-0.5 bg-gray-100 rounded border border-gray-200 text-gray-500">F</kbd> to {restaurant.is_favorite ? 'unfavorite' : 'favorite'}
+              </span>
+            </div>
           </div>
           {restaurant.tabelog_score && (
             <div className={`text-2xl font-bold ${
@@ -78,6 +123,7 @@ export default function RestaurantDetail() {
             <p className="text-sm text-gray-600 whitespace-pre-wrap">{restaurant.notes}</p>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

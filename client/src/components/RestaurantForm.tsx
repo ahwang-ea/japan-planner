@@ -18,6 +18,7 @@ interface ScrapedData {
   phone?: string;
   price_range?: string;
   hours?: string;
+  image_url?: string;
 }
 
 const emptyForm = {
@@ -37,6 +38,7 @@ const emptyForm = {
   omakase_url: '',
   tablecheck_url: '',
   tableall_url: '',
+  image_url: '',
 };
 
 export default function RestaurantForm({ restaurantId, onSaved, onCancel }: Props) {
@@ -68,6 +70,7 @@ export default function RestaurantForm({ restaurantId, onSaved, onCancel }: Prop
           omakase_url: (r.omakase_url as string) || '',
           tablecheck_url: (r.tablecheck_url as string) || '',
           tableall_url: (r.tableall_url as string) || '',
+          image_url: (r.image_url as string) || '',
         });
         setScrapeUrl((r.tabelog_url as string) || '');
       });
@@ -98,6 +101,7 @@ export default function RestaurantForm({ restaurantId, onSaved, onCancel }: Prop
         phone: data.phone || f.phone,
         price_range: data.price_range || f.price_range,
         hours: data.hours || f.hours,
+        image_url: data.image_url || f.image_url,
       }));
     } catch (e) {
       setError(`Scrape failed: ${e}`);
@@ -129,6 +133,7 @@ export default function RestaurantForm({ restaurantId, onSaved, onCancel }: Prop
         omakase_url: form.omakase_url || null,
         tablecheck_url: form.tablecheck_url || null,
         tableall_url: form.tableall_url || null,
+        image_url: form.image_url || null,
       };
       if (isEdit) {
         await api(`/restaurants/${restaurantId}`, { method: 'PUT', body: JSON.stringify(body) });

@@ -66,7 +66,7 @@ restaurantsRouter.post('/', (req, res) => {
   const {
     name, name_ja, tabelog_url, tabelog_score, cuisine, area, city,
     address, phone, price_range, hours, notes, rank,
-    omakase_url, tablecheck_url, tableall_url
+    omakase_url, tablecheck_url, tableall_url, image_url
   } = req.body;
 
   if (!name) {
@@ -74,14 +74,21 @@ restaurantsRouter.post('/', (req, res) => {
     return;
   }
 
-  const stmt = db.prepare(`
-    INSERT INTO restaurants (id, name, name_ja, tabelog_url, tabelog_score, cuisine, area, city,
-      address, phone, price_range, hours, notes, rank, omakase_url, tablecheck_url, tableall_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  stmt.run(id, name, name_ja, tabelog_url, tabelog_score, cuisine, area, city,
-    address, phone, price_range, hours, notes, rank, omakase_url, tablecheck_url, tableall_url);
+  try {
+    db.prepare(`
+      INSERT INTO restaurants (id, name, name_ja, tabelog_url, tabelog_score, cuisine, area, city,
+        address, phone, price_range, hours, notes, rank, omakase_url, tablecheck_url, tableall_url, image_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, name, name_ja, tabelog_url, tabelog_score, cuisine, area, city,
+      address, phone, price_range, hours, notes, rank, omakase_url, tablecheck_url, tableall_url, image_url);
+  } catch (e: unknown) {
+    if (e instanceof Error && e.message.includes('UNIQUE') && tabelog_url) {
+      const existing = db.prepare('SELECT * FROM restaurants WHERE tabelog_url = ?').get(tabelog_url);
+      res.json(existing);
+      return;
+    }
+    throw e;
+  }
 
   const restaurant = db.prepare('SELECT * FROM restaurants WHERE id = ?').get(id);
   res.status(201).json(restaurant);
@@ -98,18 +105,33 @@ restaurantsRouter.put('/:id', (req, res) => {
   const {
     name, name_ja, tabelog_url, tabelog_score, cuisine, area, city,
     address, phone, price_range, hours, notes, rank,
-    omakase_url, tablecheck_url, tableall_url
+    omakase_url, tablecheck_url, tableall_url, image_url
   } = req.body;
 
   db.prepare(`
     UPDATE restaurants SET
       name = ?, name_ja = ?, tabelog_url = ?, tabelog_score = ?, cuisine = ?, area = ?, city = ?,
       address = ?, phone = ?, price_range = ?, hours = ?, notes = ?, rank = ?,
-      omakase_url = ?, tablecheck_url = ?, tableall_url = ?, updated_at = datetime('now')
+      omakase_url = ?, tablecheck_url = ?, tableall_url = ?, image_url = ?, updated_at = datetime('now')
     WHERE id = ?
   `).run(name, name_ja, tabelog_url, tabelog_score, cuisine, area, city,
     address, phone, price_range, hours, notes, rank,
-    omakase_url, tablecheck_url, tableall_url, req.params.id);
+    omakase_url, tablecheck_url, tableall_url, image_url, req.params.id);
+
+  const restaurant = db.prepare('SELECT * FROM restaurants WHERE id = ?').get(req.params.id);
+  res.json(restaurant);
+});
+
+// Toggle favorite
+restaurantsRouter.patch('/:id/favorite', (req, res) => {
+  const existing = db.prepare('SELECT * FROM restaurants WHERE id = ?').get(req.params.id) as { is_favorite: number } | undefined;
+  if (!existing) {
+    res.status(404).json({ error: 'Restaurant not found' });
+    return;
+  }
+
+  db.prepare('UPDATE restaurants SET is_favorite = ?, updated_at = datetime(\'now\') WHERE id = ?')
+    .run(existing.is_favorite ? 0 : 1, req.params.id);
 
   const restaurant = db.prepare('SELECT * FROM restaurants WHERE id = ?').get(req.params.id);
   res.json(restaurant);

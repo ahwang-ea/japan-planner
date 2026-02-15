@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS restaurants (
   omakase_url TEXT,
   tablecheck_url TEXT,
   tableall_url TEXT,
+  image_url TEXT,
+  is_favorite INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS trip_restaurants (
   restaurant_id TEXT NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
   sort_order INTEGER NOT NULL DEFAULT 0,
   day_assigned TEXT,
+  meal TEXT,
   notes TEXT,
   UNIQUE(trip_id, restaurant_id)
 );
