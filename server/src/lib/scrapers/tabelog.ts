@@ -1,4 +1,6 @@
 import { chromium, type Browser, type Page } from 'playwright';
+import fs from 'fs';
+import path from 'path';
 
 let browser: Browser | null = null;
 
@@ -25,6 +27,7 @@ export interface TabelogData {
   phone: string | null;
   price_range: string | null;
   hours: string | null;
+  image_url: string | null;
 }
 
 export interface TabelogListResult {
@@ -48,9 +51,32 @@ export const TABELOG_CITIES: Record<string, string> = {
   kanazawa: 'ishikawa',
 };
 
-// Cache: key = "city:page", value = { data, timestamp }
-const browseCache = new Map<string, { data: TabelogListResult; timestamp: number }>();
+// File-backed cache persists across server restarts
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_FILE = path.join(process.env.DATABASE_PATH ? path.dirname(process.env.DATABASE_PATH) : './data', 'tabelog-cache.json');
+
+type CacheEntry = { data: TabelogListResult; timestamp: number };
+let browseCache = new Map<string, CacheEntry>();
+
+function loadCacheFromDisk() {
+  try {
+    if (fs.existsSync(CACHE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf-8')) as Record<string, CacheEntry>;
+      browseCache = new Map(Object.entries(raw));
+    }
+  } catch { /* ignore corrupt cache */ }
+}
+
+function saveCacheToDisk() {
+  try {
+    const dir = path.dirname(CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(Object.fromEntries(browseCache)));
+  } catch { /* non-critical */ }
+}
+
+// Load on module init
+loadCacheFromDisk();
 
 async function textOf(page: Page, selector: string, parent?: string): Promise<string | null> {
   const loc = parent ? page.locator(parent).locator(selector) : page.locator(selector);
@@ -144,10 +170,28 @@ export async function browseTabelog(city: string, page: number = 1, refresh: boo
         priceRange = prices.join(' / ') || null;
       } catch { /* skip */ }
 
+      // Image thumbnail
+      let imageUrl: string | null = null;
+      try {
+        for (const imgSel of ['.list-rst__rst-photo img', '.list-rst__photo img', '.list-rst__img img', 'img.js-cassette-img']) {
+          const imgEl = item.locator(imgSel).first();
+          for (const attr of ['src', 'data-original', 'data-src']) {
+            try {
+              const val = await imgEl.getAttribute(attr, { timeout: 300 });
+              if (val && val.startsWith('http') && !val.includes('no_image')) {
+                imageUrl = val;
+                break;
+              }
+            } catch { continue; }
+          }
+          if (imageUrl) break;
+        }
+      } catch { /* no image */ }
+
       const entry: TabelogData = {
         name, name_ja: null, tabelog_url: tabelogUrl, tabelog_score: score,
         cuisine, area, city, address: null, phone: null,
-        price_range: priceRange, hours: null,
+        price_range: priceRange, hours: null, image_url: imageUrl,
       };
 
       // Dedup: keep the entry with the best data
@@ -179,6 +223,7 @@ export async function browseTabelog(city: string, page: number = 1, refresh: boo
     };
 
     browseCache.set(cacheKey, { data: result, timestamp: Date.now() });
+    saveCacheToDisk();
     return result;
   } finally {
     await context.close();
@@ -255,10 +300,35 @@ export async function scrapeTabelog(url: string): Promise<TabelogData> {
       city = (structured.address as Record<string, string>).addressLocality || null;
     }
 
+    // Image
+    let imageUrl: string | null = null;
+    if (structured?.image) {
+      const img = structured.image;
+      if (typeof img === 'string') {
+        imageUrl = img;
+      } else if (Array.isArray(img) && img.length > 0) {
+        const first = img[0];
+        imageUrl = typeof first === 'string' ? first : (first as Record<string, string>)?.url || null;
+      } else if (typeof img === 'object' && img !== null) {
+        imageUrl = (img as Record<string, string>).url || null;
+      }
+    }
+    if (!imageUrl) {
+      for (const imgSel of ['.rstdtl-top-photo img', '.rdheader-photo img', '.js-imagebox-main img', '.rstdtl-photo img']) {
+        try {
+          const src = await pageObj.locator(imgSel).first().getAttribute('src', { timeout: 300 });
+          if (src && src.startsWith('http') && !src.includes('no_image')) {
+            imageUrl = src;
+            break;
+          }
+        } catch { continue; }
+      }
+    }
+
     return {
       name, name_ja: nameJa, tabelog_url: url,
       tabelog_score: score, cuisine, area, city, address, phone,
-      price_range: priceRange, hours: null,
+      price_range: priceRange, hours: null, image_url: imageUrl,
     };
   } finally {
     await context.close();

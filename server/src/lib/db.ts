@@ -23,4 +23,9 @@ db.pragma('foreign_keys = ON');
 const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
 db.exec(schema);
 
+// Migrations for existing databases
+try { db.exec('ALTER TABLE restaurants ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('ALTER TABLE restaurants ADD COLUMN image_url TEXT'); } catch {}
+try { db.exec('ALTER TABLE trip_restaurants ADD COLUMN meal TEXT'); } catch {}
+
 export default db;

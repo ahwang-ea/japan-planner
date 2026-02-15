@@ -6,7 +6,7 @@ import path from 'path';
 
 function getServerPort(): number {
   try {
-    const portFile = path.join(__dirname, '../server/.port');
+    const portFile = path.join(__dirname, '../.port');
     return parseInt(fs.readFileSync(portFile, 'utf-8').trim(), 10);
   } catch {
     return 3100; // fallback
@@ -19,7 +19,10 @@ export default defineConfig({
     port: 5200,
     strictPort: false, // auto-increment if 5200 is taken
     proxy: {
-      '/api': `http://localhost:${getServerPort()}`,
+      '/api': {
+        target: `http://localhost:${getServerPort()}`,
+        timeout: 120000, // 2 min — Tabelog scrapes can be slow on first load
+      },
     },
   },
   resolve: {
