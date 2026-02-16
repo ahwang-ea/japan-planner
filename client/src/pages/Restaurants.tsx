@@ -743,6 +743,18 @@ export default function Restaurants() {
     }
   }, [partySizePopoverOpen]);
 
+  // Close trip popover on outside click
+  useEffect(() => {
+    if (!tripPopoverOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (tripPopoverRef.current && !tripPopoverRef.current.contains(e.target as Node)) {
+        setTripPopoverOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [tripPopoverOpen]);
+
   // Clamp selection when list changes
   useEffect(() => {
     setSelectedRowIndex(i => {
