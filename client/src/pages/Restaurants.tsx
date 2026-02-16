@@ -6,7 +6,7 @@ import RestaurantForm from '../components/RestaurantForm';
 import RestaurantDetailPanel from '../components/RestaurantDetailPanel';
 import AddToTripModal from '../components/AddToTripModal';
 import SmartDateInput from '../components/SmartDateInput';
-import { CITIES } from '../lib/constants';
+import { CITIES, COMMON_CUISINES } from '../lib/constants';
 
 export interface Restaurant {
   id: string;
@@ -95,6 +95,14 @@ export default function Restaurants() {
   const [favoriteUrls, setFavoriteUrls] = useState<Set<string>>(new Set());
   const [animatingFavorite, setAnimatingFavorite] = useState<string | null>(null);
   const [showTripModal, setShowTripModal] = useState(false);
+  const [cuisinePopoverOpen, setCuisinePopoverOpen] = useState(false);
+  const [cuisineQuery, setCuisineQuery] = useState('');
+  const [cuisineHighlightIdx, setCuisineHighlightIdx] = useState(0);
+  const cuisinePopoverRef = useRef<HTMLDivElement>(null);
+  const cuisineInputRef = useRef<HTMLInputElement>(null);
+  const [partySizePopoverOpen, setPartySizePopoverOpen] = useState(false);
+  const [partySizeHighlightIdx, setPartySizeHighlightIdx] = useState(1); // 0-indexed: idx 1 = 2 guests
+  const partySizePopoverRef = useRef<HTMLDivElement>(null);
   const [showBookableOnly, setShowBookableOnly] = useState(false);
   const [showSpotsOpenOnly, setShowSpotsOpenOnly] = useState(false);
   const [filterDateFrom, setFilterDateFrom] = useState('');
@@ -111,6 +119,8 @@ export default function Restaurants() {
   const availQueueRef = useRef<string[]>([]);
   const availQueuedSetRef = useRef<Set<string>>(new Set());
   const availProcessingRef = useRef(false);
+  const pendingFilterKeyRef = useRef<string | null>(null);
+  const pendingFilterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const MIN_FILTERED = 20;
   const MAX_PAGES = 10; // safety limit per sort mode
@@ -287,10 +297,19 @@ export default function Restaurants() {
 
   const isFiltering = selectedCuisines.size > 0 || showBookableOnly || showSpotsOpenOnly;
 
-  // Collect unique cuisines from ALL fetched results
-  const availableCuisines = [...new Set(
-    allResults.flatMap(r => r.cuisine ? r.cuisine.split(',').map(c => c.trim()) : []).filter(Boolean)
-  )].sort();
+  // Collect unique cuisines: start with common set, merge in discovered ones from results
+  const availableCuisines = [...new Set([
+    ...COMMON_CUISINES,
+    ...allResults.flatMap(r => r.cuisine ? r.cuisine.split(',').map(c => c.trim()) : []).filter(Boolean),
+  ])].sort();
+
+  const CITY_KEYS = ['1','2','3','4','5','6','7','8','9','0','-','='] as const;
+
+  const filteredPopoverCuisines = useMemo(() => {
+    if (!cuisineQuery) return availableCuisines;
+    const q = cuisineQuery.toLowerCase();
+    return availableCuisines.filter(c => c.toLowerCase().includes(q));
+  }, [availableCuisines, cuisineQuery]);
 
   const toggleCuisine = (c: string) => {
     setSelectedCuisines(prev => {
@@ -666,6 +685,46 @@ export default function Restaurants() {
     setDetailIndex(null);
   }, [tab]);
 
+  // Close cuisine popover on outside click
+  useEffect(() => {
+    if (!cuisinePopoverOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (cuisinePopoverRef.current && !cuisinePopoverRef.current.contains(e.target as Node)) {
+        setCuisinePopoverOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [cuisinePopoverOpen]);
+
+  // Auto-focus cuisine input when popover opens
+  useEffect(() => {
+    if (cuisinePopoverOpen) {
+      setCuisineQuery('');
+      setCuisineHighlightIdx(0);
+      requestAnimationFrame(() => cuisineInputRef.current?.focus());
+    }
+  }, [cuisinePopoverOpen]);
+
+  // Close party size popover on outside click
+  useEffect(() => {
+    if (!partySizePopoverOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (partySizePopoverRef.current && !partySizePopoverRef.current.contains(e.target as Node)) {
+        setPartySizePopoverOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [partySizePopoverOpen]);
+
+  // Sync highlight to current party size when popover opens
+  useEffect(() => {
+    if (partySizePopoverOpen) {
+      setPartySizeHighlightIdx(filterPartySize - 1);
+    }
+  }, [partySizePopoverOpen]);
+
   // Clamp selection when list changes
   useEffect(() => {
     setSelectedRowIndex(i => {
@@ -712,6 +771,62 @@ export default function Restaurants() {
         return;
       }
 
+      // Browse tab filter shortcuts
+      if (tab === 'browse' && !cuisinePopoverOpen && !partySizePopoverOpen) {
+        // Two-key "d" prefix for date inputs
+        if (pendingFilterKeyRef.current === 'd') {
+          pendingFilterKeyRef.current = null;
+          if (pendingFilterTimerRef.current) { clearTimeout(pendingFilterTimerRef.current); pendingFilterTimerRef.current = null; }
+          if (key === 'f') {
+            e.preventDefault();
+            (document.querySelector('#date-from input') as HTMLInputElement)?.focus();
+            return;
+          } else if (key === 'e') {
+            e.preventDefault();
+            (document.querySelector('#date-to input') as HTMLInputElement)?.focus();
+            return;
+          }
+          // Unknown second key — fall through
+        }
+
+        // City number keys (1-9, 0, -, =)
+        const cityIdx = CITY_KEYS.indexOf(key as typeof CITY_KEYS[number]);
+        const targetCity = cityIdx !== -1 && cityIdx < CITIES.length ? CITIES[cityIdx] : null;
+        if (targetCity) {
+          e.preventDefault();
+          if (targetCity !== city) handleCityChange(targetCity);
+          return;
+        }
+        if (key === '/') {
+          e.preventDefault();
+          setCuisinePopoverOpen(true);
+          return;
+        }
+        if (key === 'd') {
+          e.preventDefault();
+          pendingFilterKeyRef.current = 'd';
+          pendingFilterTimerRef.current = setTimeout(() => { pendingFilterKeyRef.current = null; }, 1000);
+          return;
+        }
+        if (key === 'l') { e.preventDefault(); toggleMeal('lunch'); return; }
+        if (key === 'n') { e.preventDefault(); toggleMeal('dinner'); return; }
+        if (key === 'p' || key === 'P') {
+          e.preventDefault();
+          setPartySizePopoverOpen(true);
+          return;
+        }
+        if (key === 'b') {
+          e.preventDefault();
+          setShowBookableOnly(v => { if (!v) setShowSpotsOpenOnly(false); return !v; });
+          return;
+        }
+        if (key === 's') {
+          e.preventDefault();
+          setShowSpotsOpenOnly(v => { if (!v) setShowBookableOnly(false); return !v; });
+          return;
+        }
+      }
+
       // List view
       if (key === 'j' || key === 'ArrowDown') {
         e.preventDefault();
@@ -742,7 +857,7 @@ export default function Restaurants() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [tab, currentList, selectedRowIndex, detailIndex, showForm, navigate, saved]);
+  }, [tab, currentList, selectedRowIndex, detailIndex, showForm, navigate, saved, city, cuisinePopoverOpen, partySizePopoverOpen, availableCuisines]);
 
   // Scroll selected row into view (only when list view is showing)
   useEffect(() => {
@@ -874,56 +989,131 @@ export default function Restaurants() {
         <>
           {/* Browse Tab */}
           {tab === 'browse' && (
-            <div>
-              {/* City filter */}
-              <div className="mb-4 flex items-center gap-2 flex-wrap">
-                {CITIES.map(c => (
+            <div className="overflow-x-hidden">
+              {/* City + Cuisine filters */}
+              <div className="mb-4 flex items-center gap-1.5 flex-wrap">
+                {CITIES.map((c, i) => (
                   <button
                     key={c}
                     onClick={() => handleCityChange(c)}
-                    className={`px-3 py-1.5 text-sm rounded-full capitalize ${
+                    className={`px-2 py-1 text-xs rounded-md capitalize flex items-center gap-1 ${
                       c === city
                         ? 'bg-blue-600 text-white'
                         : 'bg-white border border-gray-200 text-gray-700 hover:bg-gray-50'
                     }`}
                   >
                     {c}
+                    <kbd className={`text-[10px] px-0.5 rounded ${
+                      c === city ? 'text-blue-200' : 'text-gray-400'
+                    }`}>{CITY_KEYS[i]}</kbd>
                   </button>
                 ))}
-              </div>
-
-              {/* Cuisine filter */}
-              {availableCuisines.length > 0 && !browseLoading && (
-                <div className="mb-4 flex items-center gap-2 flex-wrap">
-                  <span className="text-xs font-medium text-gray-500 uppercase mr-1">Cuisine:</span>
-                  {selectedCuisines.size > 0 && (
-                    <button
-                      onClick={() => setSelectedCuisines(new Set())}
-                      className="px-2 py-1 text-xs text-gray-500 hover:text-gray-700 underline"
-                    >
-                      Clear
-                    </button>
-                  )}
-                  {availableCuisines.map(c => (
-                    <button
-                      key={c}
-                      onClick={() => toggleCuisine(c)}
-                      className={`px-2.5 py-1 text-xs rounded-full ${
-                        selectedCuisines.has(c)
-                          ? 'bg-purple-600 text-white'
-                          : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
-                      }`}
-                    >
-                      {c}
-                    </button>
-                  ))}
+                <span className="mx-1 text-gray-300">|</span>
+                {/* Cuisine popover trigger */}
+                <div className="relative" ref={cuisinePopoverRef}>
+                  <button
+                    onClick={() => setCuisinePopoverOpen(o => !o)}
+                    className={`px-2.5 py-1 text-xs rounded-md flex items-center gap-1.5 ${
+                      selectedCuisines.size > 0
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    Cuisine{selectedCuisines.size > 0 && <span className="bg-white/25 rounded px-1">{selectedCuisines.size}</span>}
+                    <span className="text-[10px] opacity-60">{cuisinePopoverOpen ? '▲' : '▾'}</span>
+                    <kbd className={`text-[10px] px-0.5 rounded ${selectedCuisines.size > 0 ? 'text-purple-200' : 'text-gray-400'}`}>/</kbd>
+                  </button>
+                  {cuisinePopoverOpen && availableCuisines.length > 0 && (() => {
+                    const rect = cuisinePopoverRef.current?.getBoundingClientRect();
+                    const top = rect ? rect.bottom + 4 : 0;
+                    const left = rect ? Math.min(rect.left, window.innerWidth - 264) : 0;
+                    return (
+                    <div style={{ position: 'fixed', top, left, width: 256 }} className="bg-white border border-gray-200 rounded-lg shadow-lg z-50 overflow-hidden">
+                      <div className="p-2 border-b border-gray-100">
+                        <input
+                          ref={cuisineInputRef}
+                          type="text"
+                          value={cuisineQuery}
+                          onChange={e => { setCuisineQuery(e.target.value); setCuisineHighlightIdx(0); }}
+                          onKeyDown={e => {
+                            if (e.key === 'Escape') {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setCuisinePopoverOpen(false);
+                            } else if (e.key === 'ArrowDown' || (e.key === 'j' && e.ctrlKey)) {
+                              e.preventDefault();
+                              setCuisineHighlightIdx(i => Math.min(i + 1, filteredPopoverCuisines.length - 1));
+                            } else if (e.key === 'ArrowUp' || (e.key === 'k' && e.ctrlKey)) {
+                              e.preventDefault();
+                              setCuisineHighlightIdx(i => Math.max(i - 1, 0));
+                            } else if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              const c = filteredPopoverCuisines[cuisineHighlightIdx];
+                              if (c) toggleCuisine(c);
+                            }
+                          }}
+                          placeholder="Filter cuisines..."
+                          className="w-full px-2 py-1.5 text-xs border border-gray-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-400"
+                        />
+                      </div>
+                      <div className="max-h-56 overflow-y-auto py-1">
+                        {filteredPopoverCuisines.map((c, i) => (
+                          <button
+                            key={c}
+                            onClick={() => toggleCuisine(c)}
+                            onMouseEnter={() => setCuisineHighlightIdx(i)}
+                            className={`w-full text-left px-3 py-1.5 text-xs flex items-center gap-2 ${
+                              i === cuisineHighlightIdx ? 'bg-gray-100' : 'hover:bg-gray-50'
+                            }`}
+                          >
+                            <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 ${
+                              selectedCuisines.has(c)
+                                ? 'bg-purple-600 border-purple-600 text-white'
+                                : 'border-gray-300'
+                            }`}>
+                              {selectedCuisines.has(c) && <span className="text-[9px]">✓</span>}
+                            </span>
+                            {c}
+                          </button>
+                        ))}
+                        {filteredPopoverCuisines.length === 0 && (
+                          <div className="px-3 py-2 text-xs text-gray-400">No cuisines match "{cuisineQuery}"</div>
+                        )}
+                      </div>
+                      {selectedCuisines.size > 0 && (
+                        <div className="border-t border-gray-100 px-3 py-1.5">
+                          <button
+                            onClick={() => setSelectedCuisines(new Set())}
+                            className="text-xs text-gray-500 hover:text-gray-700 underline"
+                          >
+                            Clear all ({selectedCuisines.size})
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    );
+                  })()}
                 </div>
-              )}
+                {selectedCuisines.size > 0 && [...selectedCuisines].map(c => (
+                  <button
+                    key={c}
+                    onClick={() => toggleCuisine(c)}
+                    className="px-2 py-0.5 text-[11px] rounded bg-purple-100 text-purple-700 hover:bg-purple-200 flex items-center gap-1"
+                  >
+                    {c}<span className="text-purple-400">&times;</span>
+                  </button>
+                ))}
+                {selectedCuisines.size > 0 && (
+                  <button onClick={() => setSelectedCuisines(new Set())} className="text-[11px] text-gray-400 hover:text-gray-600 underline">
+                    clear
+                  </button>
+                )}
+              </div>
 
               {/* Date range & booking filters — always visible so dates can be entered before results load */}
               <div className="mb-4 flex items-center gap-2 flex-wrap">
                 <span className="text-xs font-medium text-gray-500 uppercase mr-1">When:</span>
-                  <div className="w-40">
+                  <div className="w-40" id="date-from">
                     <SmartDateInput
                       value={filterDateFrom}
                       onChange={setFilterDateFrom}
@@ -932,8 +1122,9 @@ export default function Restaurants() {
                       placeholder="e.g., june 3-10"
                     />
                   </div>
+                  <kbd className="text-[10px] text-gray-400 px-0.5">d f</kbd>
                   <span className="text-xs text-gray-400">&rarr;</span>
-                  <div className="w-40">
+                  <div className="w-40" id="date-to">
                     <SmartDateInput
                       value={filterDateTo}
                       onChange={setFilterDateTo}
@@ -942,6 +1133,7 @@ export default function Restaurants() {
                       referenceDate={filterDateFrom ? new Date(filterDateFrom + 'T12:00:00') : undefined}
                     />
                   </div>
+                  <kbd className="text-[10px] text-gray-400 px-0.5">d e</kbd>
                   {(filterDateFrom || filterDateTo) && (
                     <button
                       onClick={() => { setFilterDateFrom(''); setFilterDateTo(''); }}
@@ -980,34 +1172,91 @@ export default function Restaurants() {
                   <span className="mx-1 text-gray-300">|</span>
                   <button
                     onClick={() => toggleMeal('lunch')}
-                    className={`px-2.5 py-1 text-xs rounded-full ${
+                    className={`px-2.5 py-1 text-xs rounded-full flex items-center gap-1 ${
                       filterMeals.has('lunch')
                         ? 'bg-amber-500 text-white'
                         : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
                     }`}
                   >
                     Lunch
+                    <kbd className={`text-[10px] px-0.5 rounded ${filterMeals.has('lunch') ? 'text-amber-200' : 'text-gray-400'}`}>l</kbd>
                   </button>
                   <button
                     onClick={() => toggleMeal('dinner')}
-                    className={`px-2.5 py-1 text-xs rounded-full ${
+                    className={`px-2.5 py-1 text-xs rounded-full flex items-center gap-1 ${
                       filterMeals.has('dinner')
                         ? 'bg-indigo-500 text-white'
                         : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
                     }`}
                   >
                     Dinner
+                    <kbd className={`text-[10px] px-0.5 rounded ${filterMeals.has('dinner') ? 'text-indigo-200' : 'text-gray-400'}`}>n</kbd>
                   </button>
                   <span className="mx-1 text-gray-300">|</span>
-                  <select
-                    value={filterPartySize}
-                    onChange={e => setFilterPartySize(Number(e.target.value))}
-                    className="px-2 py-1 text-xs border border-gray-200 rounded-md bg-white text-gray-600"
-                  >
-                    {[1,2,3,4,5,6,7,8,9,10].map(n => (
-                      <option key={n} value={n}>{n} {n === 1 ? 'guest' : 'guests'}</option>
-                    ))}
-                  </select>
+                  <div ref={partySizePopoverRef} className="relative">
+                    <button
+                      onClick={() => setPartySizePopoverOpen(o => !o)}
+                      className="px-2.5 py-1 text-xs rounded-md flex items-center gap-1.5 bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"
+                    >
+                      {filterPartySize} {filterPartySize === 1 ? 'guest' : 'guests'}
+                      <span className="text-[10px] opacity-60">{partySizePopoverOpen ? '▲' : '▾'}</span>
+                      <kbd className="text-[10px] text-gray-400 px-0.5">p</kbd>
+                    </button>
+                    {partySizePopoverOpen && (() => {
+                      const rect = partySizePopoverRef.current?.getBoundingClientRect();
+                      const top = rect ? rect.bottom + 4 : 0;
+                      const left = rect ? Math.min(rect.left, window.innerWidth - 160) : 0;
+                      return (
+                        <div
+                          style={{ position: 'fixed', top, left, width: 140 }}
+                          className="bg-white border border-gray-200 rounded-lg shadow-lg z-50 overflow-hidden"
+                          onKeyDown={e => {
+                            if (e.key === 'Escape') {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setPartySizePopoverOpen(false);
+                            } else if (e.key === 'ArrowDown') {
+                              e.preventDefault();
+                              setPartySizeHighlightIdx(i => Math.min(i + 1, 9));
+                            } else if (e.key === 'ArrowUp') {
+                              e.preventDefault();
+                              setPartySizeHighlightIdx(i => Math.max(i - 1, 0));
+                            } else if (e.key === 'Enter') {
+                              e.preventDefault();
+                              setFilterPartySize(partySizeHighlightIdx + 1);
+                              setPartySizePopoverOpen(false);
+                            } else if (e.key >= '1' && e.key <= '9') {
+                              e.preventDefault();
+                              setFilterPartySize(Number(e.key));
+                              setPartySizePopoverOpen(false);
+                            } else if (e.key === '0') {
+                              e.preventDefault();
+                              setFilterPartySize(10);
+                              setPartySizePopoverOpen(false);
+                            }
+                          }}
+                          tabIndex={-1}
+                          ref={el => el?.focus()}
+                        >
+                          <div className="py-1">
+                            {[1,2,3,4,5,6,7,8,9,10].map((n, i) => (
+                              <button
+                                key={n}
+                                onClick={() => { setFilterPartySize(n); setPartySizePopoverOpen(false); }}
+                                onMouseEnter={() => setPartySizeHighlightIdx(i)}
+                                className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between ${
+                                  i === partySizeHighlightIdx ? 'bg-gray-100' : 'hover:bg-gray-50'
+                                } ${filterPartySize === n ? 'font-medium text-indigo-600' : ''}`}
+                              >
+                                <span>{n} {n === 1 ? 'guest' : 'guests'}</span>
+                                <kbd className="text-[10px] text-gray-400">{n === 10 ? '0' : n}</kbd>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
                 </div>
 
               {/* Availability filters */}
@@ -1023,6 +1272,7 @@ export default function Restaurants() {
                     }`}
                   >
                     Bookable Online
+                    <kbd className={`text-[10px] px-0.5 rounded ${showBookableOnly ? 'text-blue-200' : 'text-gray-400'}`}>b</kbd>
                   </button>
                   <button
                     onClick={() => { setShowSpotsOpenOnly(v => !v); if (!showSpotsOpenOnly) setShowBookableOnly(false); }}
@@ -1033,6 +1283,7 @@ export default function Restaurants() {
                     }`}
                   >
                     <span>◯</span> Spots Open
+                    <kbd className={`text-[10px] px-0.5 rounded ${showSpotsOpenOnly ? 'text-green-200' : 'text-gray-400'}`}>s</kbd>
                   </button>
                   {availChecking && (() => {
                     const totalToCheck = (isFiltering ? allResults : browseResults).length;
@@ -1257,13 +1508,18 @@ export default function Restaurants() {
                         })}
                       </tbody>
                     </table>
-                    <div className="px-4 py-2 border-t border-gray-100 bg-gray-50 flex items-center gap-4 text-xs text-gray-400">
+                    <div className="px-4 py-2 border-t border-gray-100 bg-gray-50 flex items-center gap-3 text-xs text-gray-400 flex-wrap">
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">j/k</kbd> navigate</span>
-                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">f</kbd> favorite</span>
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">Enter</kbd> view</span>
-                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">t</kbd> add to trip</span>
-                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">Esc</kbd> deselect</span>
-                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">g f</kbd> view favorites</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">f</kbd> fav</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">t</kbd> trip</span>
+                      <span className="text-gray-300">|</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">1-9</kbd> city</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">/</kbd> cuisine</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">d f/e</kbd> date</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">l</kbd><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500 ml-0.5">n</kbd> meal</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">p</kbd> guests</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">b</kbd><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500 ml-0.5">s</kbd> booking</span>
                     </div>
                   </div>
 

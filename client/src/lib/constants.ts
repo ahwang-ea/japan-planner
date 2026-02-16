@@ -3,3 +3,11 @@ export const CITIES = [
   'nagoya', 'yokohama', 'kobe', 'hiroshima', 'sendai',
   'nara', 'kanazawa',
 ] as const;
+
+export const COMMON_CUISINES = [
+  'Chinese', 'Curry', 'French', 'Fugu', 'Innovative',
+  'Italian', 'Japanese Cuisine', 'Kaiseki', 'Ramen',
+  'Seafood', 'Soba', 'Spanish', 'Sushi', 'Tempura',
+  'Teppanyaki', 'Tonkatsu', 'Udon', 'Unagi', 'Yakiniku',
+  'Yakitori',
+] as const;

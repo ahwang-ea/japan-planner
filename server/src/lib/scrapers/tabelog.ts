@@ -1,4 +1,5 @@
 import { chromium, type Browser, type Page } from 'playwright';
+import * as cheerio from 'cheerio';
 import fs from 'fs';
 import path from 'path';
 
@@ -83,19 +84,163 @@ function saveCacheToDisk() {
 // Load on module init
 loadCacheFromDisk();
 
-async function textOf(page: Page, selector: string, parent?: string): Promise<string | null> {
-  const loc = parent ? page.locator(parent).locator(selector) : page.locator(selector);
-  const first = loc.first();
-  try {
-    return (await first.textContent({ timeout: 500 }))?.trim() || null;
-  } catch {
-    return null;
+/**
+ * Parse restaurant list HTML with cheerio (fast, no browser needed).
+ * Shared by both fast fetch path and Playwright fallback.
+ */
+function parseListHtml(
+  html: string,
+  city: string,
+  dateFilter?: { date?: string; time?: string; partySize?: number },
+): { restaurants: Map<string, TabelogData>; hasNextPage: boolean } {
+  const $ = cheerio.load(html);
+  const seenUrls = new Map<string, TabelogData>();
+
+  $('.list-rst').each((_i, el) => {
+    const item = $(el);
+
+    // Name & URL
+    const nameEl = item.find('.list-rst__rst-name-target').first();
+    const name = nameEl.text().trim() || null;
+    const tabelogUrl = nameEl.attr('href') || null;
+    if (!name) return; // continue
+
+    // Score
+    let score: number | null = null;
+    const scoreText = item.find('.c-rating__val, .list-rst__rating-val').first().text().trim();
+    if (scoreText) {
+      const parsed = parseFloat(scoreText);
+      if (!isNaN(parsed) && parsed > 0 && parsed <= 5) score = parsed;
+    }
+
+    // Area & Cuisine
+    let area: string | null = null;
+    let cuisine: string | null = null;
+    const areaGenreText = item.find('.list-rst__area-genre').first().text().trim();
+    if (areaGenreText) {
+      const parts = areaGenreText.split('/');
+      area = parts[0]?.trim() || null;
+      cuisine = parts[1]?.trim() || null;
+    }
+
+    // Price range (v3 rating layout: dinner / lunch price spans)
+    const prices: string[] = [];
+    item.find('.list-rst__budget').each((_j, budgetEl) => {
+      const t = $(budgetEl).text().trim();
+      if (t) prices.push(t);
+    });
+    if (prices.length === 0) {
+      // Fallback: c-rating-v3 layout used on ranked list pages
+      item.find('.c-rating-v3.list-rst__info-item').each((_j, ratingEl) => {
+        const val = $(ratingEl).find('.c-rating-v3__val').text().trim();
+        if (val && val !== '-') {
+          const isDinner = $(ratingEl).find('.c-rating-v3__time--dinner').length > 0;
+          const isLunch = $(ratingEl).find('.c-rating-v3__time--lunch').length > 0;
+          const label = isDinner ? 'Dinner' : isLunch ? 'Lunch' : '';
+          prices.push(label ? `${label}: ${val}` : val);
+        }
+      });
+    }
+    const priceRange = prices.join(' / ') || null;
+
+    // Image thumbnail
+    let imageUrl: string | null = null;
+    // Check div.js-cassette-img for data-original (background image pattern)
+    const bgDiv = item.find('div.js-cassette-img[data-original]').first();
+    if (bgDiv.length > 0) {
+      const val = bgDiv.attr('data-original');
+      if (val && val.startsWith('http') && !val.includes('no_image')) imageUrl = val;
+    }
+    // Fallback: check img elements with various lazy-load attributes
+    if (!imageUrl) {
+      for (const imgSel of ['.list-rst__rst-photo img', '.list-rst__photo img', '.list-rst__img img', 'img.js-cassette-img']) {
+        const imgEl = item.find(imgSel).first();
+        if (imgEl.length === 0) continue;
+        for (const attr of ['data-lazy', 'data-original', 'data-src', 'src']) {
+          const val = imgEl.attr(attr);
+          if (val && val.startsWith('http') && !val.includes('no_image')) {
+            imageUrl = val;
+            break;
+          }
+        }
+        if (imageUrl) break;
+      }
+    }
+
+    // Inline reservation availability
+    let hasOnlineReservation = false;
+    let reservationUrl: string | null = null;
+    const yoyakuLink = item.find('a[href*="yoyaku.tabelog.com"]').first();
+    if (yoyakuLink.length > 0) {
+      hasOnlineReservation = true;
+      reservationUrl = yoyakuLink.attr('href') || null;
+    }
+    if (!hasOnlineReservation) {
+      const itemHtml = item.html() || '';
+      if (/Online Booking|ネット予約/i.test(itemHtml)) hasOnlineReservation = true;
+    }
+
+    // Time slots from booking links (date-filtered pages)
+    const timeSlots: string[] = [];
+    if (dateFilter?.date) {
+      item.find('a[href*="booking/form_course"]').each((_j, linkEl) => {
+        const href = $(linkEl).attr('href');
+        const timeMatch = href?.match(/visit_time=(\d{4})/);
+        if (timeMatch) {
+          const t = timeMatch[1];
+          const formatted = `${t.slice(0, 2)}:${t.slice(2, 4)}`;
+          if (!timeSlots.includes(formatted)) timeSlots.push(formatted);
+        }
+      });
+    }
+
+    const entry: TabelogData = {
+      name, name_ja: null, tabelog_url: tabelogUrl, tabelog_score: score,
+      cuisine, area, city, address: null, phone: null,
+      price_range: priceRange, hours: null, image_url: imageUrl,
+      has_online_reservation: dateFilter?.date ? true : hasOnlineReservation,
+      reservation_url: reservationUrl,
+      time_slots: timeSlots.length > 0 ? timeSlots : undefined,
+    };
+
+    // Dedup: keep the entry with the best data
+    const key = tabelogUrl || name;
+    const existing = seenUrls.get(key);
+    if (!existing) {
+      seenUrls.set(key, entry);
+    } else {
+      const quality = (e: TabelogData) =>
+        (e.tabelog_score ? 10 : 0) + (e.cuisine ? 1 : 0) +
+        (e.area ? 1 : 0) + (e.price_range ? 1 : 0);
+      if (quality(entry) > quality(existing)) {
+        seenUrls.set(key, entry);
+      }
+    }
+  });
+
+  const hasNextPage = $('a.c-pagination__arrow--next').length > 0;
+  return { restaurants: seenUrls, hasNextPage };
+}
+
+function buildBrowseUrl(citySlug: string, page: number, sort: string, dateFilter?: { date?: string; time?: string; partySize?: number }): string {
+  const params = new URLSearchParams();
+  if (sort === 'rt') params.set('SrtT', 'rt');
+  if (dateFilter?.date) {
+    params.set('svd', dateFilter.date.replace(/-/g, ''));
+    params.set('vac_net', '1');
   }
+  if (dateFilter?.time) params.set('svt', dateFilter.time);
+  if (dateFilter?.partySize) params.set('svps', String(dateFilter.partySize));
+  const queryStr = params.toString() ? `?${params.toString()}` : '';
+  return page === 1
+    ? `https://tabelog.com/en/${citySlug}/rstLst/${queryStr}`
+    : `https://tabelog.com/en/${citySlug}/rstLst/${page}/${queryStr}`;
 }
 
 /**
  * Browse Tabelog ranking page for a city, sorted by score.
- * Uses Playwright locators (server-side) to avoid tsx/evaluate issues.
+ * Uses fast HTTP fetch + cheerio for standard browsing.
+ * Falls back to Playwright for date-filtered pages (booking time slots may need JS).
  */
 export async function browseTabelog(
   city: string,
@@ -115,195 +260,51 @@ export async function browseTabelog(
   }
 
   const citySlug = TABELOG_CITIES[city.toLowerCase()] || city.toLowerCase();
-  const params = new URLSearchParams();
-  if (sort === 'rt') params.set('SrtT', 'rt');
-  if (dateFilter?.date) {
-    params.set('svd', dateFilter.date.replace(/-/g, ''));
-    params.set('vac_net', '1'); // filter to restaurants with vacancy for online reservation
-  }
-  if (dateFilter?.time) params.set('svt', dateFilter.time);
-  if (dateFilter?.partySize) params.set('svps', String(dateFilter.partySize));
-  const queryStr = params.toString() ? `?${params.toString()}` : '';
-  // Use English site for readable names; reservation detection uses HTTP pre-check separately
-  const url = page === 1
-    ? `https://tabelog.com/en/${citySlug}/rstLst/${queryStr}`
-    : `https://tabelog.com/en/${citySlug}/rstLst/${page}/${queryStr}`;
+  const url = buildBrowseUrl(citySlug, page, sort, dateFilter);
+  const hasDateFilter = !!dateFilter?.date;
 
-  console.log(`  [browse] FETCH ${url}`);
-  const b = await getBrowser();
-  const context = await b.newContext({ userAgent: UA });
-  const pageObj = await context.newPage();
+  console.log(`  [browse] FETCH ${url}${hasDateFilter ? '' : ' (fast)'}`);
 
-  try {
-    await pageObj.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    // Wait for actual restaurant list content instead of a blind 3s timer
-    await pageObj.locator('.list-rst').first().waitFor({ timeout: 5000 }).catch(() => {});
-
-    // Use locators to extract data server-side (avoids tsx __name issue with evaluate)
-    const items = pageObj.locator('.list-rst');
-    const count = await items.count();
-
-    const seenUrls = new Map<string, TabelogData>();
-
-    for (let i = 0; i < count; i++) {
-      const item = items.nth(i);
-
-      // Name & URL
-      const nameEl = item.locator('.list-rst__rst-name-target').first();
-      let name: string | null = null;
-      let tabelogUrl: string | null = null;
-      try {
-        name = (await nameEl.textContent({ timeout: 500 }))?.trim() || null;
-        tabelogUrl = await nameEl.getAttribute('href') || null;
-      } catch { /* skip */ }
-
-      if (!name) continue;
-
-      // Score
-      let score: number | null = null;
-      const scoreEl = item.locator('.c-rating__val, .list-rst__rating-val').first();
-      try {
-        const scoreText = (await scoreEl.textContent({ timeout: 500 }))?.trim();
-        if (scoreText) {
-          const parsed = parseFloat(scoreText);
-          if (!isNaN(parsed) && parsed > 0 && parsed <= 5) score = parsed;
-        }
-      } catch { /* no score */ }
-
-      // Area & Cuisine from combined "Station / Cuisine" element
-      let area: string | null = null;
-      let cuisine: string | null = null;
-      try {
-        const areaGenreText = (await item.locator('.list-rst__area-genre').first().textContent({ timeout: 500 }))?.trim();
-        if (areaGenreText) {
-          const parts = areaGenreText.split('/');
-          area = parts[0]?.trim() || null;
-          cuisine = parts[1]?.trim() || null;
-        }
-      } catch { /* skip */ }
-
-      // Price range
-      let priceRange: string | null = null;
-      try {
-        const budgetEls = item.locator('.list-rst__budget');
-        const budgetCount = await budgetEls.count();
-        const prices: string[] = [];
-        for (let j = 0; j < budgetCount; j++) {
-          const t = (await budgetEls.nth(j).textContent({ timeout: 500 }))?.trim();
-          if (t) prices.push(t);
-        }
-        priceRange = prices.join(' / ') || null;
-      } catch { /* skip */ }
-
-      // Image thumbnail
-      let imageUrl: string | null = null;
-      try {
-        for (const imgSel of ['.list-rst__rst-photo img', '.list-rst__photo img', '.list-rst__img img', 'img.js-cassette-img']) {
-          const imgEl = item.locator(imgSel).first();
-          for (const attr of ['src', 'data-original', 'data-src']) {
-            try {
-              const val = await imgEl.getAttribute(attr, { timeout: 300 });
-              if (val && val.startsWith('http') && !val.includes('no_image')) {
-                imageUrl = val;
-                break;
-              }
-            } catch { continue; }
-          }
-          if (imageUrl) break;
-        }
-      } catch { /* no image */ }
-
-      // Inline reservation availability from listing page
-      let hasOnlineReservation = false;
-      let reservationUrl: string | null = null;
-      try {
-        const yoyakuLink = item.locator('a[href*="yoyaku.tabelog.com"]').first();
-        const href = await yoyakuLink.getAttribute('href', { timeout: 300 });
-        if (href) {
-          hasOnlineReservation = true;
-          reservationUrl = href;
-        }
-      } catch { /* no reservation link */ }
-      if (!hasOnlineReservation) {
-        try {
-          // Check for "Online Booking" text (English site) or ネット予約 (Japanese site)
-          const bookingText = await item.locator('text=/Online Booking|ネット予約/i').count();
-          if (bookingText > 0) hasOnlineReservation = true;
-        } catch { /* skip */ }
-      }
-
-      // Extract available time slots from booking links (vac_net=1 pages)
-      const timeSlots: string[] = [];
-      if (dateFilter?.date) {
-        try {
-          const bookingLinks = item.locator('a[href*="booking/form_course"]');
-          const linkCount = await bookingLinks.count();
-          for (let j = 0; j < linkCount; j++) {
-            const href = await bookingLinks.nth(j).getAttribute('href', { timeout: 300 });
-            const timeMatch = href?.match(/visit_time=(\d{4})/);
-            if (timeMatch) {
-              const t = timeMatch[1];
-              const formatted = `${t.slice(0, 2)}:${t.slice(2, 4)}`;
-              if (!timeSlots.includes(formatted)) timeSlots.push(formatted);
-            }
-          }
-        } catch { /* no booking links */ }
-      }
-
-      const entry: TabelogData = {
-        name, name_ja: null, tabelog_url: tabelogUrl, tabelog_score: score,
-        cuisine, area, city, address: null, phone: null,
-        price_range: priceRange, hours: null, image_url: imageUrl,
-        has_online_reservation: dateFilter?.date ? true : hasOnlineReservation,
-        reservation_url: reservationUrl,
-        time_slots: timeSlots.length > 0 ? timeSlots : undefined,
-      };
-
-      // Dedup: keep the entry with the best data
-      const key = tabelogUrl || name;
-      const existing = seenUrls.get(key);
-      if (!existing) {
-        seenUrls.set(key, entry);
-      } else {
-        const quality = (e: TabelogData) =>
-          (e.tabelog_score ? 10 : 0) + (e.cuisine ? 1 : 0) +
-          (e.area ? 1 : 0) + (e.price_range ? 1 : 0);
-        if (quality(entry) > quality(existing)) {
-          seenUrls.set(key, entry);
-        }
-      }
-    }
-
-    const hasDateFilter = !!dateFilter?.date;
-    const bookableCount = Array.from(seenUrls.values()).filter(r => r.has_online_reservation).length;
-    console.log(`  [browse] ${citySlug} p${page} sort=${sort}${hasDateFilter ? ` date=${dateFilter.date} vac_net=1` : ''}: ${seenUrls.size} restaurants, ${bookableCount} bookable online`);
-
-    // Check for next page
-    const nextLink = pageObj.locator('a.c-pagination__arrow--next').first();
-    let hasNextPage = false;
+  let html: string;
+  if (hasDateFilter) {
+    // Date-filtered pages may have JS-rendered booking slots — use Playwright
+    const b = await getBrowser();
+    const context = await b.newContext({ userAgent: UA });
+    const pageObj = await context.newPage();
     try {
-      hasNextPage = await nextLink.isVisible({ timeout: 500 });
-    } catch { /* no next */ }
-    // Normalize date to YYYY-MM-DD for consistency with availability dates
-    const normalizedDate = hasDateFilter && dateFilter.date
-      ? (dateFilter.date.length === 8
-        ? `${dateFilter.date.slice(0,4)}-${dateFilter.date.slice(4,6)}-${dateFilter.date.slice(6,8)}`
-        : dateFilter.date)
-      : undefined;
-    const result: TabelogListResult = {
-      restaurants: Array.from(seenUrls.values()),
-      page,
-      hasNextPage,
-      dateFiltered: hasDateFilter || undefined,
-      filteredDate: normalizedDate,
-    };
-
-    browseCache.set(cacheKey, { data: result, timestamp: Date.now() });
-    saveCacheToDisk();
-    return result;
-  } finally {
-    await context.close();
+      await pageObj.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await pageObj.locator('.list-rst').first().waitFor({ timeout: 5000 }).catch(() => {});
+      html = await pageObj.content();
+    } finally {
+      await context.close();
+    }
+  } else {
+    // Standard browse: fast HTTP fetch (page is server-rendered)
+    const res = await fetch(url, { headers: { 'User-Agent': UA } });
+    html = await res.text();
   }
+
+  const { restaurants: seenUrls, hasNextPage } = parseListHtml(html, city, dateFilter);
+
+  const bookableCount = Array.from(seenUrls.values()).filter(r => r.has_online_reservation).length;
+  console.log(`  [browse] ${citySlug} p${page} sort=${sort}${hasDateFilter ? ` date=${dateFilter.date} vac_net=1` : ''}: ${seenUrls.size} restaurants, ${bookableCount} bookable online`);
+
+  const normalizedDate = hasDateFilter && dateFilter.date
+    ? (dateFilter.date.length === 8
+      ? `${dateFilter.date.slice(0,4)}-${dateFilter.date.slice(4,6)}-${dateFilter.date.slice(6,8)}`
+      : dateFilter.date)
+    : undefined;
+  const result: TabelogListResult = {
+    restaurants: Array.from(seenUrls.values()),
+    page,
+    hasNextPage,
+    dateFiltered: hasDateFilter || undefined,
+    filteredDate: normalizedDate,
+  };
+
+  browseCache.set(cacheKey, { data: result, timestamp: Date.now() });
+  saveCacheToDisk();
+  return result;
 }
 
 /**
