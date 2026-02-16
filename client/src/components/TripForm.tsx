@@ -73,16 +73,14 @@ export default function TripForm({ onCreated, onCancel }: Props) {
 
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">City</label>
-          <input
+          <select
             value={form.city}
             onChange={e => setForm(f => ({ ...f, city: e.target.value }))}
-            list="city-suggestions"
-            placeholder="e.g., tokyo"
-            className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-          />
-          <datalist id="city-suggestions">
-            {CITIES.map(c => <option key={c} value={c} />)}
-          </datalist>
+            className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm capitalize focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+          >
+            <option value="">Select a city</option>
+            {CITIES.map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

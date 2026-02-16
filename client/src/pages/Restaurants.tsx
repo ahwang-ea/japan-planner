@@ -5,6 +5,7 @@ import { isInputFocused } from '../lib/keyboard';
 import RestaurantForm from '../components/RestaurantForm';
 import RestaurantDetailPanel from '../components/RestaurantDetailPanel';
 import AddToTripModal from '../components/AddToTripModal';
+import TripForm from '../components/TripForm';
 import SmartDateInput from '../components/SmartDateInput';
 import { CITIES, COMMON_CUISINES } from '../lib/constants';
 
@@ -103,6 +104,11 @@ export default function Restaurants() {
   const [partySizePopoverOpen, setPartySizePopoverOpen] = useState(false);
   const [partySizeHighlightIdx, setPartySizeHighlightIdx] = useState(1); // 0-indexed: idx 1 = 2 guests
   const partySizePopoverRef = useRef<HTMLDivElement>(null);
+  const [tripPopoverOpen, setTripPopoverOpen] = useState(false);
+  const [tripHighlightIdx, setTripHighlightIdx] = useState(0);
+  const tripPopoverRef = useRef<HTMLDivElement>(null);
+  const [showNewTripModal, setShowNewTripModal] = useState(false);
+  const [appliedTripId, setAppliedTripId] = useState<string | null>(null);
   const [showBookableOnly, setShowBookableOnly] = useState(false);
   const [showSpotsOpenOnly, setShowSpotsOpenOnly] = useState(false);
   const [filterDateFrom, setFilterDateFrom] = useState('');
@@ -275,6 +281,18 @@ export default function Restaurants() {
     setBroadSearchPage(0);
     setBroadHasNext(true);
     browse(c, 1);
+  };
+
+  const applyTrip = (trip: { id: string; name: string; city: string | null; start_date: string; end_date: string }) => {
+    setAppliedTripId(trip.id);
+    setFilterDateFrom(trip.start_date);
+    setFilterDateTo(trip.end_date);
+    setShowSpotsOpenOnly(true);
+    setShowBookableOnly(false);
+    if (trip.city) {
+      const cityKey = CITIES.find(c => c.toLowerCase() === trip.city?.toLowerCase());
+      if (cityKey && cityKey !== city) handleCityChange(cityKey);
+    }
   };
 
   // Navigate pages (no-filter mode): fetch a single page, but also keep it in allResults
@@ -725,6 +743,18 @@ export default function Restaurants() {
     }
   }, [partySizePopoverOpen]);
 
+  // Close trip popover on outside click
+  useEffect(() => {
+    if (!tripPopoverOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (tripPopoverRef.current && !tripPopoverRef.current.contains(e.target as Node)) {
+        setTripPopoverOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [tripPopoverOpen]);
+
   // Clamp selection when list changes
   useEffect(() => {
     setSelectedRowIndex(i => {
@@ -772,7 +802,7 @@ export default function Restaurants() {
       }
 
       // Browse tab filter shortcuts
-      if (tab === 'browse' && !cuisinePopoverOpen && !partySizePopoverOpen) {
+      if (tab === 'browse' && !cuisinePopoverOpen && !partySizePopoverOpen && !tripPopoverOpen) {
         // Two-key "d" prefix for date inputs
         if (pendingFilterKeyRef.current === 'd') {
           pendingFilterKeyRef.current = null;
@@ -825,6 +855,11 @@ export default function Restaurants() {
           setShowSpotsOpenOnly(v => { if (!v) setShowBookableOnly(false); return !v; });
           return;
         }
+        if (key === 'a') {
+          e.preventDefault();
+          setTripPopoverOpen(true);
+          return;
+        }
       }
 
       // List view
@@ -857,7 +892,7 @@ export default function Restaurants() {
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [tab, currentList, selectedRowIndex, detailIndex, showForm, navigate, saved, city, cuisinePopoverOpen, partySizePopoverOpen, availableCuisines]);
+  }, [tab, currentList, selectedRowIndex, detailIndex, showForm, navigate, saved, city, cuisinePopoverOpen, partySizePopoverOpen, tripPopoverOpen, availableCuisines]);
 
   // Scroll selected row into view (only when list view is showing)
   useEffect(() => {
@@ -1142,33 +1177,91 @@ export default function Restaurants() {
                       clear
                     </button>
                   )}
-                  {trips.length > 0 && (
-                    <>
-                      <span className="mx-1 text-gray-300">|</span>
-                      <select
-                        value=""
-                        onChange={e => {
-                          const trip = trips.find(t => t.id === e.target.value);
-                          if (trip) {
-                            setFilterDateFrom(trip.start_date);
-                            setFilterDateTo(trip.end_date);
-                            if (trip.city) {
-                              const cityKey = CITIES.find(c => c.toLowerCase() === trip.city?.toLowerCase());
-                              if (cityKey && cityKey !== city) handleCityChange(cityKey);
+                  <span className="mx-1 text-gray-300">|</span>
+                  <div ref={tripPopoverRef} className="relative">
+                    {(() => {
+                      const appliedTrip = appliedTripId ? trips.find(t => t.id === appliedTripId) : null;
+                      return (
+                        <button
+                          onClick={() => { setTripPopoverOpen(o => !o); setTripHighlightIdx(0); }}
+                          className={`px-2.5 py-1 text-xs rounded-md flex items-center gap-1.5 ${
+                            appliedTrip
+                              ? 'bg-teal-600 text-white'
+                              : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                          }`}
+                        >
+                          {appliedTrip ? appliedTrip.name : 'Apply trip'}
+                          <span className="text-[10px] opacity-60">{tripPopoverOpen ? '▲' : '▾'}</span>
+                          <kbd className={`text-[10px] px-0.5 rounded ${appliedTrip ? 'text-teal-200' : 'text-gray-400'}`}>a</kbd>
+                        </button>
+                      );
+                    })()}
+                    {tripPopoverOpen && (() => {
+                      const rect = tripPopoverRef.current?.getBoundingClientRect();
+                      const top = rect ? rect.bottom + 4 : 0;
+                      const left = rect ? Math.min(rect.left, window.innerWidth - 260) : 0;
+                      const items = [...trips, { id: '__new__', name: '+ New Trip', city: null, start_date: '', end_date: '' }];
+                      return (
+                        <div
+                          style={{ position: 'fixed', top, left, width: 260 }}
+                          className="bg-white border border-gray-200 rounded-lg shadow-lg z-50 overflow-hidden"
+                          onKeyDown={e => {
+                            if (e.key === 'Escape') {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setTripPopoverOpen(false);
+                            } else if (e.key === 'ArrowDown') {
+                              e.preventDefault();
+                              setTripHighlightIdx(i => Math.min(i + 1, items.length - 1));
+                            } else if (e.key === 'ArrowUp') {
+                              e.preventDefault();
+                              setTripHighlightIdx(i => Math.max(i - 1, 0));
+                            } else if (e.key === 'Enter') {
+                              e.preventDefault();
+                              const item = items[tripHighlightIdx];
+                              setTripPopoverOpen(false);
+                              if (item.id === '__new__') {
+                                setShowNewTripModal(true);
+                              } else {
+                                applyTrip(item);
+                              }
                             }
-                          }
-                        }}
-                        className="px-2 py-1 text-xs border border-gray-200 rounded-md bg-white text-gray-600"
-                      >
-                        <option value="">Apply trip...</option>
-                        {trips.map(t => (
-                          <option key={t.id} value={t.id}>
-                            {t.name} ({t.start_date} &mdash; {t.end_date})
-                          </option>
-                        ))}
-                      </select>
-                    </>
-                  )}
+                          }}
+                          tabIndex={-1}
+                          ref={el => el?.focus()}
+                        >
+                          <div className="py-1 max-h-64 overflow-y-auto">
+                            {items.map((item, i) => (
+                              <button
+                                key={item.id}
+                                onClick={() => {
+                                  setTripPopoverOpen(false);
+                                  if (item.id === '__new__') {
+                                    setShowNewTripModal(true);
+                                  } else {
+                                    applyTrip(item);
+                                  }
+                                }}
+                                onMouseEnter={() => setTripHighlightIdx(i)}
+                                className={`w-full text-left px-3 py-1.5 text-xs ${
+                                  i === tripHighlightIdx ? 'bg-gray-100' : 'hover:bg-gray-50'
+                                } ${item.id === '__new__' ? 'border-t border-gray-100 font-medium text-blue-600' : ''} ${
+                                  item.id === appliedTripId ? 'font-medium text-teal-600' : ''
+                                }`}
+                              >
+                                {item.id === '__new__' ? item.name : (
+                                  <span className="flex items-center justify-between gap-2">
+                                    <span className="truncate">{item.name}</span>
+                                    <span className="text-gray-400 shrink-0">{item.start_date} – {item.end_date}</span>
+                                  </span>
+                                )}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
                   <span className="mx-1 text-gray-300">|</span>
                   <button
                     onClick={() => toggleMeal('lunch')}
@@ -1710,6 +1803,25 @@ export default function Restaurants() {
           />
         );
       })()}
+
+      {showNewTripModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setShowNewTripModal(false)}>
+          <div className="w-full max-w-md" onClick={e => e.stopPropagation()}>
+            <TripForm
+              onCreated={() => {
+                setShowNewTripModal(false);
+                api<typeof trips>('/trips').then(newTrips => {
+                  setTrips(newTrips);
+                  if (newTrips.length > 0) {
+                    applyTrip(newTrips[newTrips.length - 1]);
+                  }
+                });
+              }}
+              onCancel={() => setShowNewTripModal(false)}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
