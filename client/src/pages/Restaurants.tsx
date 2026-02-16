@@ -37,6 +37,7 @@ export interface TabelogResult {
   name: string | null;
   name_ja: string | null;
   tabelog_url: string | null;
+  tableall_url?: string | null;
   tabelog_score: number | null;
   cuisine: string | null;
   area: string | null;
@@ -114,6 +115,8 @@ export default function Restaurants() {
   const [appliedTripId, setAppliedTripId] = useState<string | null>(null);
   const [showBookableOnly, setShowBookableOnly] = useState(false);
   const [showSpotsOpenOnly, setShowSpotsOpenOnly] = useState(false);
+  const [showTabelog, setShowTabelog] = useState(true);
+  const [showTableAll, setShowTableAll] = useState(true);
   const [filterDateFrom, setFilterDateFrom] = useState('');
   const [filterDateTo, setFilterDateTo] = useState('');
   const [filterMeals, setFilterMeals] = useState<Set<'lunch' | 'dinner'>>(new Set());
@@ -178,7 +181,7 @@ export default function Restaurants() {
   }, [showBookableOnly, showSpotsOpenOnly, filterDateFrom, filterMeals, filterPartySize]);
 
   const effectiveDateFilterKey = effectiveDateFilter
-    ? `${city}:${effectiveDateFilter.svd}:${filterDateTo || ''}:${effectiveDateFilter.svt || ''}:${effectiveDateFilter.svps || ''}`
+    ? `${city}:${effectiveDateFilter.svd}:${filterDateTo || ''}:${effectiveDateFilter.svt || ''}:${effectiveDateFilter.svps || ''}:tl=${showTabelog}:ta=${showTableAll}`
     : '';
   const dateFilterBrowsedRef = useRef(effectiveDateFilterKey);
 
@@ -193,8 +196,14 @@ export default function Restaurants() {
     setSavedLoading(true);
     api<Restaurant[]>('/restaurants').then(r => {
       setSaved(r);
-      setSavedUrls(new Set(r.map(x => x.tabelog_url ? normalizeUrl(x.tabelog_url) : '').filter(Boolean)));
-      setFavoriteUrls(new Set(r.filter(x => x.is_favorite).map(x => x.tabelog_url ? normalizeUrl(x.tabelog_url) : '').filter(Boolean)));
+      setSavedUrls(new Set(r.flatMap(x => [
+        x.tabelog_url ? normalizeUrl(x.tabelog_url) : '',
+        x.tableall_url || '',
+      ]).filter(Boolean)));
+      setFavoriteUrls(new Set(r.filter(x => x.is_favorite).flatMap(x => [
+        x.tabelog_url ? normalizeUrl(x.tabelog_url) : '',
+        x.tableall_url || '',
+      ]).filter(Boolean)));
     }).finally(() => setSavedLoading(false));
   };
 
@@ -203,10 +212,13 @@ export default function Restaurants() {
       setTrips(t);
       const active = t.find(x => (x as { is_active?: number }).is_active);
       if (active) {
-        api<{ restaurants: { tabelog_url: string | null }[] }>(`/trips/${active.id}`).then(trip => {
+        api<{ restaurants: { tabelog_url: string | null; tableall_url?: string | null }[] }>(`/trips/${active.id}`).then(trip => {
           setTripRestaurantUrls(new Set(
             trip.restaurants
-              .map(r => r.tabelog_url ? normalizeUrl(r.tabelog_url) : '')
+              .flatMap(r => [
+                r.tabelog_url ? normalizeUrl(r.tabelog_url) : '',
+                r.tableall_url || '',
+              ])
               .filter(Boolean)
           ));
         }).catch(() => {});
@@ -332,7 +344,7 @@ export default function Restaurants() {
       .finally(() => setBrowseLoading(false));
   };
 
-  const isFiltering = selectedCuisines.size > 0 || showBookableOnly || showSpotsOpenOnly;
+  const isFiltering = selectedCuisines.size > 0 || showBookableOnly || showSpotsOpenOnly || !showTabelog || !showTableAll;
 
   // Collect unique cuisines: start with common set, merge in discovered ones from results
   const availableCuisines = [...new Set([
@@ -364,8 +376,14 @@ export default function Restaurants() {
   };
 
   const getAvail = (r: TabelogResult) => {
-    if (!r.tabelog_url) return undefined;
-    return availabilityMap.get(r.tabelog_url) ?? availabilityMap.get(normalizeUrl(r.tabelog_url));
+    if (r.tabelog_url) {
+      const a = availabilityMap.get(r.tabelog_url) ?? availabilityMap.get(normalizeUrl(r.tabelog_url));
+      if (a) return a;
+    }
+    if (r.tableall_url) {
+      return availabilityMap.get(r.tableall_url);
+    }
+    return undefined;
   };
 
   const getNearestAvailDate = (r: TabelogResult) => {
@@ -380,6 +398,9 @@ export default function Restaurants() {
   // When filtering: show matches from all accumulated results; otherwise show current page
   const filteredResults = isFiltering
     ? allResults.filter(r => {
+        // Source filter
+        if (!showTabelog && r.tabelog_url && !r.tableall_url) return false;
+        if (!showTableAll && r.tableall_url) return false;
         if (selectedCuisines.size > 0 && !matchesCuisine(r)) return false;
         if (showBookableOnly) {
           // Use inline data from browse (instant — no separate check needed)
@@ -405,6 +426,7 @@ export default function Restaurants() {
         }
         return true;
       })
+      .sort((a, b) => (b.tabelog_score ?? 0) - (a.tabelog_score ?? 0))
     : browseResults;
 
   // How many restaurants still need detailed availability checks (respects cuisine filter)
@@ -413,7 +435,10 @@ export default function Restaurants() {
     : allResults;
   const anyBookable = cuisineFiltered.some(r => r.has_online_reservation);
   const uncheckedCount = cuisineFiltered.filter(r => {
-    if (!r.tabelog_url || availabilityMap.has(r.tabelog_url)) return false;
+    const url = r.tabelog_url || r.tableall_url;
+    if (!url) return false;
+    const key = r.tabelog_url ? normalizeUrl(r.tabelog_url) : url;
+    if (availabilityMap.has(key)) return false;
     return anyBookable ? r.has_online_reservation : true;
   }).length;
 
@@ -486,16 +511,13 @@ export default function Restaurants() {
                             lastSearchConfigRef.current.svps !== currentConfig.svps ||
                             lastSearchConfigRef.current.city !== currentConfig.city;
       lastSearchConfigRef.current = currentConfig;
-      let firstChunk = true;
+      if (configChanged) {
+        setAvailabilityMap(new Map());
+      }
 
-      // Stream NDJSON response for progressive updates
-      fetch('/api/availability/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ city, dates: datesToSearch, meal, partySize: filterPartySize }),
-        signal: abortController.signal,
-      }).then(async (response) => {
-        if (!response.ok || !response.body) throw new Error('Search request failed');
+      // Process NDJSON stream from an availability search endpoint
+      const processNDJSONStream = async (response: Response, label: string) => {
+        if (!response.ok || !response.body) throw new Error(`${label} search request failed`);
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buffer = '';
@@ -505,13 +527,12 @@ export default function Restaurants() {
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
 
-          // Process complete lines
           const lines = buffer.split('\n');
-          buffer = lines.pop() || ''; // keep incomplete line in buffer
+          buffer = lines.pop() || '';
 
           for (const line of lines) {
             if (!line.trim()) continue;
-            if (dateFilterBrowsedRef.current !== searchKey) return; // stale
+            if (dateFilterBrowsedRef.current !== searchKey) return;
 
             const msg = JSON.parse(line);
 
@@ -523,50 +544,52 @@ export default function Restaurants() {
                 timeSlots: Record<string, string[]>;
               };
 
-              console.log(`[batch-avail] streamed ${date}: ${available.length} available, ${dateRestaurants.length} new restaurants`);
+              console.log(`[${label}] streamed ${date}: ${available.length} available, ${dateRestaurants.length} new restaurants`);
 
-              // Merge new restaurants into allResults
               if (dateRestaurants.length > 0) {
                 setAllResults(prev => {
-                  const existingUrls = new Set(prev.map(x => x.tabelog_url ? normalizeUrl(x.tabelog_url) : '').filter(Boolean));
-                  const newOnes = dateRestaurants.filter(
-                    (r: TabelogResult) => r.tabelog_url && !existingUrls.has(normalizeUrl(r.tabelog_url))
-                  );
+                  // Build set of ALL known URLs (both tabelog and tableall) for robust dedup
+                  const existingUrls = new Set<string>();
+                  for (const x of prev) {
+                    if (x.tabelog_url) existingUrls.add(normalizeUrl(x.tabelog_url));
+                    if (x.tableall_url) existingUrls.add(x.tableall_url);
+                  }
+                  const newOnes = dateRestaurants.filter((r: TabelogResult) => {
+                    if (r.tabelog_url && existingUrls.has(normalizeUrl(r.tabelog_url))) return false;
+                    if (r.tableall_url && existingUrls.has(r.tableall_url)) return false;
+                    return !!(r.tabelog_url || r.tableall_url);
+                  });
                   return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
                 });
               }
 
-              // Update availability map incrementally
               setAvailabilityMap(prev => {
-                const next = (firstChunk && configChanged) ? new Map<string, ReservationAvailability>() : new Map(prev);
-                firstChunk = false;
-                const availableNorm = new Set(available.map(u => normalizeUrl(u)));
+                const next = new Map(prev);
+                const availableSet = new Set(available.map(u => u.includes('tabelog.com') ? normalizeUrl(u) : u));
 
-                // Update every known restaurant with this date's status
-                // (restaurants from both browse and search results)
                 const allKnownUrls = new Set([
                   ...available,
-                  ...Array.from(prev.keys()),
+                  ...Array.from(prev.keys()).filter(k =>
+                    label === 'tableall' ? k.includes('tableall.com') : k.includes('tabelog.com')
+                  ),
                 ]);
                 for (const url of allKnownUrls) {
-                  const normalUrl = normalizeUrl(url);
-                  const isAvailable = availableNorm.has(normalUrl);
-                  const slots = dateTimeSlots[url] || dateTimeSlots[normalUrl] || [];
-                  const existing = next.get(normalUrl);
+                  const key = url.includes('tabelog.com') ? normalizeUrl(url) : url;
+                  const isAvailable = availableSet.has(key);
+                  const slots = dateTimeSlots[url] || dateTimeSlots[key] || [];
+                  const existing = next.get(key);
                   const newDateEntry = { date, status: (isAvailable ? 'available' : 'unavailable') as 'available' | 'unavailable', timeSlots: slots };
 
                   if (existing) {
-                    // Add or update this date in existing entry
                     const otherDates = existing.dates.filter(d => d.date !== date);
-                    const updatedDates = [...otherDates, newDateEntry];
-                    next.set(normalUrl, {
+                    next.set(key, {
                       ...existing,
                       hasOnlineReservation: existing.hasOnlineReservation || isAvailable,
-                      dates: updatedDates,
+                      dates: [...otherDates, newDateEntry],
                     });
                   } else if (isAvailable) {
-                    next.set(normalUrl, {
-                      tabelogUrl: normalUrl,
+                    next.set(key, {
+                      tabelogUrl: key,
                       hasOnlineReservation: true,
                       reservationUrl: null,
                       dates: [newDateEntry],
@@ -577,19 +600,59 @@ export default function Restaurants() {
                 return next;
               });
             } else if (msg.type === 'done') {
-              console.log(`[batch-avail] stream done: ${msg.totalRestaurants} total restaurants`);
+              console.log(`[${label}] stream done: ${msg.totalRestaurants} total restaurants`);
             }
           }
         }
-      }).catch(err => {
-        if (err.name === 'AbortError') {
-          console.log('[batch-avail] search aborted');
-        } else {
-          console.error('[batch-avail] search failed:', err);
-        }
-      }).finally(() => {
+      };
+
+      // Fire Tabelog and TableAll searches in parallel (skip disabled sources)
+      const searches: Promise<void>[] = [];
+
+      if (showTabelog) {
+        searches.push(
+          fetch('/api/availability/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ city, dates: datesToSearch, meal, partySize: filterPartySize }),
+            signal: abortController.signal,
+          }).then(r => processNDJSONStream(r, 'tabelog'))
+            .catch(err => { if (err.name !== 'AbortError') console.error('[batch-avail] tabelog search failed:', err); })
+        );
+      }
+
+      if (showTableAll) {
+        const tableallArea = city.charAt(0).toUpperCase() + city.slice(1).toLowerCase();
+        searches.push(
+          fetch('/api/availability/search-tableall', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dates: datesToSearch, area: tableallArea }),
+            signal: abortController.signal,
+          }).then(r => processNDJSONStream(r, 'tableall'))
+            .catch(err => { if (err.name !== 'AbortError') console.error('[batch-avail] tableall search failed:', err); })
+        );
+      }
+
+      Promise.all(searches).finally(() => {
         batchSearchRunningRef.current = false;
         setAvailChecking(false);
+        // Cross-match: enrich TableAll entries with Tabelog scores from parallel results
+        setAllResults(prev => {
+          const scoreByName = new Map<string, number>();
+          for (const r of prev) {
+            if (r.tabelog_score && r.name) scoreByName.set(r.name, r.tabelog_score);
+          }
+          let changed = false;
+          const updated = prev.map(r => {
+            if (!r.tabelog_score && r.tableall_url && r.name && scoreByName.has(r.name)) {
+              changed = true;
+              return { ...r, tabelog_score: scoreByName.get(r.name)! };
+            }
+            return r;
+          });
+          return changed ? updated : prev;
+        });
       });
     }, 200); // reduced debounce — SmartDateInput already confirms on Enter/blur
 
@@ -682,8 +745,9 @@ export default function Restaurants() {
   // Save a browse result and immediately favorite it
   const saveAndFavorite = async (r: TabelogResult) => {
     if (!r.name) return;
-    setSavingUrl(r.tabelog_url);
-    if (r.tabelog_url) triggerFavoriteAnimation(r.tabelog_url);
+    const primaryUrl = r.tabelog_url || r.tableall_url || null;
+    setSavingUrl(primaryUrl);
+    if (primaryUrl) triggerFavoriteAnimation(primaryUrl);
     try {
       const created = await api<Restaurant>('/restaurants', {
         method: 'POST',
@@ -691,6 +755,7 @@ export default function Restaurants() {
           name: r.name,
           name_ja: r.name_ja,
           tabelog_url: r.tabelog_url,
+          tableall_url: r.tableall_url,
           tabelog_score: r.tabelog_score,
           cuisine: r.cuisine,
           area: r.area,
@@ -1131,7 +1196,7 @@ export default function Restaurants() {
             if (!item) return false;
             return 'id' in item
               ? !!(item as Restaurant).is_favorite
-              : !!(item.tabelog_url && favoriteUrls.has(normalizeUrl(item.tabelog_url)));
+              : !!((item.tabelog_url && favoriteUrls.has(normalizeUrl(item.tabelog_url))) || (item.tableall_url && favoriteUrls.has(item.tableall_url)));
           })()}
           isSaving={savingUrl === currentList[detailIndex]?.tabelog_url}
           favoriteAnimating={(() => {
@@ -1484,7 +1549,29 @@ export default function Restaurants() {
 
               {/* Availability filters */}
               {(browseResults.length > 0 || allResults.length > 0) && (
-                <div className="mb-4 flex items-center gap-2">
+                <div className="mb-4 flex items-center gap-2 flex-wrap">
+                  <span className="text-xs font-medium text-gray-500 uppercase mr-1">Source:</span>
+                  <button
+                    onClick={() => { if (!showTabelog || showTableAll) setShowTabelog(v => !v); }}
+                    className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
+                      showTabelog
+                        ? 'bg-amber-500 text-white'
+                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    Tabelog
+                  </button>
+                  <button
+                    onClick={() => { if (!showTableAll || showTabelog) setShowTableAll(v => !v); }}
+                    className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
+                      showTableAll
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    TableAll
+                  </button>
+                  <span className="mx-1 text-gray-300">|</span>
                   <span className="text-xs font-medium text-gray-500 uppercase mr-1">Booking:</span>
                   <button
                     onClick={() => { setShowBookableOnly(v => !v); if (!showBookableOnly) setShowSpotsOpenOnly(false); }}
@@ -1627,13 +1714,14 @@ export default function Restaurants() {
                       </thead>
                       <tbody className="divide-y divide-gray-200">
                         {filteredResults.map((r, idx) => {
-                          const isItemSaved = r.tabelog_url ? savedUrls.has(normalizeUrl(r.tabelog_url)) : false;
-                          const isSaving = savingUrl === r.tabelog_url;
-                          const isInTrip = r.tabelog_url ? tripRestaurantUrls.has(normalizeUrl(r.tabelog_url)) : false;
+                          const primaryUrl = r.tabelog_url || r.tableall_url;
+                          const isItemSaved = (r.tabelog_url && savedUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && savedUrls.has(r.tableall_url)) || false;
+                          const isSaving = savingUrl === primaryUrl;
+                          const isInTrip = (r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url)) || false;
                           const isSelected = selectedRows.has(idx);
                           return (
                             <tr
-                              key={r.tabelog_url || idx}
+                              key={primaryUrl || idx}
                               data-row-index={idx}
                               className={`cursor-pointer ${
                                 isSelected ? 'bg-teal-50' : ''
@@ -1654,13 +1742,19 @@ export default function Restaurants() {
                                   )}
                                   <div>
                                     <div className="text-sm font-medium text-gray-900">{r.name || 'Unknown'}</div>
-                                    {r.tabelog_url && (
+                                    {r.tabelog_url ? (
                                       <a href={r.tabelog_url} target="_blank" rel="noopener noreferrer"
                                         onClick={e => e.stopPropagation()}
                                         className="text-xs text-blue-500 hover:text-blue-700">
                                         View on Tabelog
                                       </a>
-                                    )}
+                                    ) : r.tableall_url ? (
+                                      <a href={r.tableall_url} target="_blank" rel="noopener noreferrer"
+                                        onClick={e => e.stopPropagation()}
+                                        className="text-xs text-purple-500 hover:text-purple-700">
+                                        View on TableAll
+                                      </a>
+                                    ) : null}
                                   </div>
                                 </div>
                               </td>
@@ -1734,7 +1828,7 @@ export default function Restaurants() {
                               )}
                               <td className="px-4 py-3 text-right">
                                 {(() => {
-                                  const isFav = r.tabelog_url && favoriteUrls.has(normalizeUrl(r.tabelog_url));
+                                  const isFav = (r.tabelog_url && favoriteUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && favoriteUrls.has(r.tableall_url));
                                   const isAnimating = (r.tabelog_url && animatingFavorite === r.tabelog_url) || (r.tabelog_url && saved.find(s => s.tabelog_url && r.tabelog_url && normalizeUrl(s.tabelog_url) === normalizeUrl(r.tabelog_url))?.id === animatingFavorite);
                                   return (
                                     <button
@@ -1895,7 +1989,7 @@ export default function Restaurants() {
                           </td>
                           <td className="px-4 py-3 text-sm text-gray-500">{r.rank ?? idx + 1}</td>
                           <td className="px-1 py-3 text-center w-8">
-                            {r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url)) && (
+                            {((r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url))) && (
                               <span className="text-teal-500 text-sm" title="In trip">●</span>
                             )}
                           </td>
