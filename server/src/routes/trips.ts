@@ -124,23 +124,27 @@ tripsRouter.post('/:id/restaurants', (req, res) => {
   const id = uuid();
   const sortOrder = (maxOrder?.max_order ?? -1) + 1;
 
-  try {
+  // SQLite treats NULLs as distinct in UNIQUE constraints, so check manually when day/meal are NULL
+  const dayVal = day_assigned || null;
+  const mealVal = meal || null;
+  const existing = db.prepare(`
+    SELECT id FROM trip_restaurants
+    WHERE trip_id = ? AND restaurant_id = ? AND day_assigned IS ? AND meal IS ?
+  `).get(req.params.id, restaurant_id, dayVal, mealVal) as { id: string } | undefined;
+
+  if (existing) {
     db.prepare(`
-      INSERT INTO trip_restaurants (id, trip_id, restaurant_id, sort_order, day_assigned, meal, status, booked_via, auto_dates)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, req.params.id, restaurant_id, sortOrder, day_assigned || null, meal || null, bookingStatus, via, auto_dates ? 1 : 0);
-  } catch (e: unknown) {
-    if (e instanceof Error && e.message.includes('UNIQUE')) {
-      // Same restaurant already on this exact slot — update status + auto_dates
-      db.prepare(`
-        UPDATE trip_restaurants SET status = ?, booked_via = ?, auto_dates = ?
-        WHERE trip_id = ? AND restaurant_id = ? AND day_assigned IS ? AND meal IS ?
-      `).run(bookingStatus, via, auto_dates ? 1 : 0, req.params.id, restaurant_id, day_assigned || null, meal || null);
-      res.json({ success: true, updated: true });
-      return;
-    }
-    throw e;
+      UPDATE trip_restaurants SET status = ?, booked_via = ?, auto_dates = ?
+      WHERE id = ?
+    `).run(bookingStatus, via, auto_dates ? 1 : 0, existing.id);
+    res.json({ success: true, updated: true });
+    return;
   }
+
+  db.prepare(`
+    INSERT INTO trip_restaurants (id, trip_id, restaurant_id, sort_order, day_assigned, meal, status, booked_via, auto_dates)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, req.params.id, restaurant_id, sortOrder, dayVal, mealVal, bookingStatus, via, auto_dates ? 1 : 0);
 
   res.status(201).json({ success: true, id });
 });
