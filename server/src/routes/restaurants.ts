@@ -31,7 +31,9 @@ restaurantsRouter.get('/browse', async (req, res) => {
     const svt = req.query.svt as string | undefined;
     const svps = req.query.svps ? parseInt(req.query.svps as string) : undefined;
     const dateFilter = svd ? { date: svd, time: svt, partySize: svps } : undefined;
+    console.log(`[API] /browse city=${city} page=${page} sort=${sort} refresh=${refresh}${svd ? ` svd=${svd}` : ''}${svt ? ` svt=${svt}` : ''}${svps ? ` svps=${svps}` : ''}`);
     const result = await browseTabelog(city, page, refresh, sort, dateFilter);
+    console.log(`[API] /browse → ${result.restaurants.length} results, hasNext=${result.hasNextPage}${result.dateFiltered ? ` dateFiltered=${result.filteredDate}` : ''}`);
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: 'Failed to browse Tabelog', details: String(error) });

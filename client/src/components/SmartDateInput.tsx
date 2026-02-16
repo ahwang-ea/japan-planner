@@ -100,6 +100,10 @@ export default function SmartDateInput({
     if (e.key === 'Enter') {
       e.preventDefault();
       confirm();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      confirm();
+      inputRef.current?.blur();
     }
   };
 
