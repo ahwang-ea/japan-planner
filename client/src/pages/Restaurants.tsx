@@ -196,8 +196,14 @@ export default function Restaurants() {
     setSavedLoading(true);
     api<Restaurant[]>('/restaurants').then(r => {
       setSaved(r);
-      setSavedUrls(new Set(r.map(x => x.tabelog_url ? normalizeUrl(x.tabelog_url) : '').filter(Boolean)));
-      setFavoriteUrls(new Set(r.filter(x => x.is_favorite).map(x => x.tabelog_url ? normalizeUrl(x.tabelog_url) : '').filter(Boolean)));
+      setSavedUrls(new Set(r.flatMap(x => [
+        x.tabelog_url ? normalizeUrl(x.tabelog_url) : '',
+        x.tableall_url || '',
+      ]).filter(Boolean)));
+      setFavoriteUrls(new Set(r.filter(x => x.is_favorite).flatMap(x => [
+        x.tabelog_url ? normalizeUrl(x.tabelog_url) : '',
+        x.tableall_url || '',
+      ]).filter(Boolean)));
     }).finally(() => setSavedLoading(false));
   };
 
@@ -206,10 +212,13 @@ export default function Restaurants() {
       setTrips(t);
       const active = t.find(x => (x as { is_active?: number }).is_active);
       if (active) {
-        api<{ restaurants: { tabelog_url: string | null }[] }>(`/trips/${active.id}`).then(trip => {
+        api<{ restaurants: { tabelog_url: string | null; tableall_url?: string | null }[] }>(`/trips/${active.id}`).then(trip => {
           setTripRestaurantUrls(new Set(
             trip.restaurants
-              .map(r => r.tabelog_url ? normalizeUrl(r.tabelog_url) : '')
+              .flatMap(r => [
+                r.tabelog_url ? normalizeUrl(r.tabelog_url) : '',
+                r.tableall_url || '',
+              ])
               .filter(Boolean)
           ));
         }).catch(() => {});
@@ -391,7 +400,7 @@ export default function Restaurants() {
     ? allResults.filter(r => {
         // Source filter
         if (!showTabelog && r.tabelog_url && !r.tableall_url) return false;
-        if (!showTableAll && r.tableall_url && !r.tabelog_url) return false;
+        if (!showTableAll && r.tableall_url) return false;
         if (selectedCuisines.size > 0 && !matchesCuisine(r)) return false;
         if (showBookableOnly) {
           // Use inline data from browse (instant — no separate check needed)
@@ -502,7 +511,9 @@ export default function Restaurants() {
                             lastSearchConfigRef.current.svps !== currentConfig.svps ||
                             lastSearchConfigRef.current.city !== currentConfig.city;
       lastSearchConfigRef.current = currentConfig;
-      let firstChunk = true;
+      if (configChanged) {
+        setAvailabilityMap(new Map());
+      }
 
       // Process NDJSON stream from an availability search endpoint
       const processNDJSONStream = async (response: Response, label: string) => {
@@ -553,8 +564,7 @@ export default function Restaurants() {
               }
 
               setAvailabilityMap(prev => {
-                const next = (firstChunk && configChanged) ? new Map<string, ReservationAvailability>() : new Map(prev);
-                firstChunk = false;
+                const next = new Map(prev);
                 const availableSet = new Set(available.map(u => u.includes('tabelog.com') ? normalizeUrl(u) : u));
 
                 const allKnownUrls = new Set([
@@ -1186,7 +1196,7 @@ export default function Restaurants() {
             if (!item) return false;
             return 'id' in item
               ? !!(item as Restaurant).is_favorite
-              : !!(item.tabelog_url && favoriteUrls.has(normalizeUrl(item.tabelog_url)));
+              : !!((item.tabelog_url && favoriteUrls.has(normalizeUrl(item.tabelog_url))) || (item.tableall_url && favoriteUrls.has(item.tableall_url)));
           })()}
           isSaving={savingUrl === currentList[detailIndex]?.tabelog_url}
           favoriteAnimating={(() => {
@@ -1705,9 +1715,9 @@ export default function Restaurants() {
                       <tbody className="divide-y divide-gray-200">
                         {filteredResults.map((r, idx) => {
                           const primaryUrl = r.tabelog_url || r.tableall_url;
-                          const isItemSaved = r.tabelog_url ? savedUrls.has(normalizeUrl(r.tabelog_url)) : false;
+                          const isItemSaved = (r.tabelog_url && savedUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && savedUrls.has(r.tableall_url)) || false;
                           const isSaving = savingUrl === primaryUrl;
-                          const isInTrip = r.tabelog_url ? tripRestaurantUrls.has(normalizeUrl(r.tabelog_url)) : false;
+                          const isInTrip = (r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url)) || false;
                           const isSelected = selectedRows.has(idx);
                           return (
                             <tr
@@ -1818,7 +1828,7 @@ export default function Restaurants() {
                               )}
                               <td className="px-4 py-3 text-right">
                                 {(() => {
-                                  const isFav = r.tabelog_url && favoriteUrls.has(normalizeUrl(r.tabelog_url));
+                                  const isFav = (r.tabelog_url && favoriteUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && favoriteUrls.has(r.tableall_url));
                                   const isAnimating = (r.tabelog_url && animatingFavorite === r.tabelog_url) || (r.tabelog_url && saved.find(s => s.tabelog_url && r.tabelog_url && normalizeUrl(s.tabelog_url) === normalizeUrl(r.tabelog_url))?.id === animatingFavorite);
                                   return (
                                     <button
@@ -1979,7 +1989,7 @@ export default function Restaurants() {
                           </td>
                           <td className="px-4 py-3 text-sm text-gray-500">{r.rank ?? idx + 1}</td>
                           <td className="px-1 py-3 text-center w-8">
-                            {r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url)) && (
+                            {((r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url))) && (
                               <span className="text-teal-500 text-sm" title="In trip">●</span>
                             )}
                           </td>
