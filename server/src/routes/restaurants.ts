@@ -18,7 +18,7 @@ restaurantsRouter.get('/browse', async (req, res) => {
   const page = parseInt(req.query.page as string) || 1;
 
   try {
-    const { browseTabelog, TABELOG_CITIES } = await import('../lib/scrapers/tabelog.js');
+    const { browseTabelog, TABELOG_CITIES, getCachedPlatformLinks } = await import('../lib/scrapers/tabelog.js');
 
     if (req.query.cities === 'true') {
       res.json({ cities: Object.keys(TABELOG_CITIES) });
@@ -34,7 +34,15 @@ restaurantsRouter.get('/browse', async (req, res) => {
     console.log(`[API] /browse city=${city} page=${page} sort=${sort} refresh=${refresh}${svd ? ` svd=${svd}` : ''}${svt ? ` svt=${svt}` : ''}${svps ? ` svps=${svps}` : ''}`);
     const result = await browseTabelog(city, page, refresh, sort, dateFilter);
     console.log(`[API] /browse → ${result.restaurants.length} results, hasNext=${result.hasNextPage}${result.dateFiltered ? ` dateFiltered=${result.filteredDate}` : ''}`);
-    res.json(result);
+
+    // Enrich restaurants with cached platform links
+    const enriched = result.restaurants.map(r => {
+      if (!r.name) return r;
+      const cached = getCachedPlatformLinks(r.name, city);
+      return cached ? { ...r, ...cached } : r;
+    });
+
+    res.json({ ...result, restaurants: enriched });
   } catch (error) {
     res.status(500).json({ error: 'Failed to browse Tabelog', details: String(error) });
   }

@@ -106,7 +106,7 @@ availabilityRouter.post('/search', async (req, res) => {
   res.on('close', () => { clientGone = true; });
 
   try {
-    const { browseTabelog } = await import('../lib/scrapers/tabelog.js');
+    const { browseTabelog, getCachedPlatformLinks, discoverPlatformLinks } = await import('../lib/scrapers/tabelog.js');
     // svt (time) is REQUIRED for vac_net=1 to actually filter — without it Tabelog returns all restaurants
     const time = meal === 'lunch' ? '1200' : '1900';
     const MAX_PAGES_PER_DATE = 5;
@@ -146,13 +146,16 @@ availabilityRouter.post('/search', async (req, res) => {
 
       console.log(`[avail-search]   ${date}: ${available.length} available`);
 
-      // Stream this date's results immediately
+      // Stream this date's results immediately, enriched with cached platform links
       if (!clientGone) {
         res.write(JSON.stringify({
           type: 'date',
           date,
           available,
-          restaurants: dateRestaurants,
+          restaurants: dateRestaurants.map(r => {
+            const cached = r.name ? getCachedPlatformLinks(r.name, city, r.area) : null;
+            return cached ? { ...r, ...cached } : r;
+          }),
           timeSlots: dateTimeSlots,
         }) + '\n');
       }
@@ -162,6 +165,28 @@ availabilityRouter.post('/search', async (req, res) => {
     if (!clientGone) {
       res.write(JSON.stringify({ type: 'done', totalRestaurants: allRestaurants.size }) + '\n');
     }
+
+    // Background: discover platform links for high-rated restaurants without cached links
+    const toDiscover = [...allRestaurants.values()]
+      .filter(r => r.name && (r.tabelog_score ?? 0) >= 3.7 && !getCachedPlatformLinks(r.name, city, r.area));
+
+    if (toDiscover.length > 0 && !clientGone) {
+      console.log(`[avail-search] discovering platform links for ${toDiscover.length} restaurants (3.7+)`);
+      const DISCOVER_CONCURRENCY = 3;
+      for (let i = 0; i < toDiscover.length && !clientGone; i += DISCOVER_CONCURRENCY) {
+        const batch = toDiscover.slice(i, i + DISCOVER_CONCURRENCY);
+        const results = await Promise.all(batch.map(async r => {
+          const links = await discoverPlatformLinks(r.name!, city, r.area, r.address, r.phone, r.tabelog_url);
+          return { tabelog_url: r.tabelog_url, name: r.name, ...links };
+        }));
+        // Stream discovered links to client
+        const withLinks = results.filter(r => r.tablecheck_url || r.omakase_url || r.tableall_url);
+        if (withLinks.length > 0 && !clientGone) {
+          res.write(JSON.stringify({ type: 'platform-update', restaurants: withLinks }) + '\n');
+        }
+      }
+    }
+
     res.end();
   } catch (error) {
     console.error('[avail-search] failed', error);
@@ -193,9 +218,11 @@ availabilityRouter.post('/search-tableall', async (req, res) => {
 
   try {
     const { browseTableAll } = await import('../lib/scrapers/tableall.js');
+    const { lookupScoresByName, getCachedPlatformLinks, discoverPlatformLinks } = await import('../lib/scrapers/tabelog.js');
     const sortedDates = (dates as string[]).slice(0, 14).sort();
     const dateFrom = sortedDates[0]!;
     const dateTo = sortedDates[sortedDates.length - 1]!;
+    const cityKey = (area || 'tokyo').toLowerCase();
 
     console.log(`[tableall-search] dates=${sortedDates.join(',')} area=${area || 'all'}`);
 
@@ -216,8 +243,7 @@ availabilityRouter.post('/search-tableall', async (req, res) => {
     // Fallback: look up scores from Tabelog browse cache + Tabelog search
     const uncoveredNames = names.filter(n => !scoreByName.has(n));
     if (uncoveredNames.length > 0) {
-      const { lookupScoresByName } = await import('../lib/scrapers/tabelog.js');
-      const cacheMatches = await lookupScoresByName(uncoveredNames, (area || 'tokyo').toLowerCase());
+      const cacheMatches = await lookupScoresByName(uncoveredNames, cityKey);
       for (const [name, data] of cacheMatches) {
         scoreByName.set(name, data);
       }
@@ -255,11 +281,14 @@ availabilityRouter.post('/search-tableall', async (req, res) => {
         available,
         restaurants: dateRestaurants.map(r => {
           const match = scoreByName.get(r.name);
+          const cached = getCachedPlatformLinks(r.name, cityKey, r.area);
           return {
             name: r.name,
             name_ja: null,
             tabelog_url: match?.tabelog_url || null,
             tableall_url: r.tableall_url,
+            tablecheck_url: cached?.tablecheck_url || null,
+            omakase_url: cached?.omakase_url || null,
             tabelog_score: match?.tabelog_score || null,
             cuisine: r.cuisine,
             area: r.area,
@@ -277,12 +306,293 @@ availabilityRouter.post('/search-tableall', async (req, res) => {
     if (!clientGone) {
       res.write(JSON.stringify({ type: 'done', totalRestaurants: result.restaurants.length }) + '\n');
     }
+
+    // Background: discover platform links for restaurants without cached links
+    const toDiscover = result.restaurants
+      .filter(r => r.name && !getCachedPlatformLinks(r.name, cityKey, r.area));
+    if (toDiscover.length > 0 && !clientGone) {
+      console.log(`[tableall-search] discovering platform links for ${toDiscover.length} restaurants`);
+      const DISCOVER_CONCURRENCY = 3;
+      for (let i = 0; i < toDiscover.length && !clientGone; i += DISCOVER_CONCURRENCY) {
+        const batch = toDiscover.slice(i, i + DISCOVER_CONCURRENCY);
+        const results = await Promise.all(batch.map(async r => {
+          const links = await discoverPlatformLinks(r.name, cityKey, r.area);
+          const match = scoreByName.get(r.name);
+          return { ...links, tabelog_url: match?.tabelog_url || null, name: r.name, tableall_url: r.tableall_url };
+        }));
+        const withLinks = results.filter(r => r.tablecheck_url || r.omakase_url);
+        if (withLinks.length > 0 && !clientGone) {
+          res.write(JSON.stringify({ type: 'platform-update', restaurants: withLinks }) + '\n');
+        }
+      }
+    }
+
     res.end();
   } catch (error) {
     console.error('[tableall-search] failed', error);
     if (!res.headersSent) {
       res.status(500).json({ error: 'TableAll search failed', details: String(error) });
     } else if (!clientGone) {
+      res.write(JSON.stringify({ type: 'error', error: String(error) }) + '\n');
+      res.end();
+    }
+  }
+});
+
+// TableCheck date-range availability search
+// Streams results per-date as NDJSON (same format as /search) for the client to consume
+availabilityRouter.post('/search-tablecheck', async (req, res) => {
+  const { dates, city, partySize, meal } = req.body;
+  if (!dates?.length) {
+    res.status(400).json({ error: 'dates[] is required' });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let clientGone = false;
+  res.on('close', () => { clientGone = true; });
+
+  try {
+    const { browseTableCheck } = await import('../lib/scrapers/tablecheck.js');
+    const { lookupScoresByName, getCachedPlatformLinks, discoverPlatformLinks } = await import('../lib/scrapers/tabelog.js');
+    const sortedDates = (dates as string[]).slice(0, 14).sort();
+    const dateFrom = sortedDates[0]!;
+    const dateTo = sortedDates[sortedDates.length - 1]!;
+    const cityKey = (city || 'tokyo').toLowerCase();
+
+    console.log(`[tablecheck-search] dates=${sortedDates.join(',')} city=${cityKey} party=${partySize || 2} meal=${meal || 'any'}`);
+
+    const result = await browseTableCheck(dateFrom, dateTo, cityKey, partySize || 2, meal || undefined);
+
+    if (clientGone) return;
+
+    // Enrich with Tabelog ratings — check DB first, then Tabelog browse cache
+    const names = result.restaurants.map(r => r.name);
+    const placeholders = names.map(() => '?').join(',');
+    const dbMatches = names.length > 0
+      ? db.prepare(`SELECT name, tabelog_url, tabelog_score FROM restaurants WHERE name IN (${placeholders})`).all(...names) as { name: string; tabelog_url: string | null; tabelog_score: number | null }[]
+      : [];
+    const scoreByName = new Map<string, { tabelog_url: string | null; tabelog_score: number | null }>(
+      dbMatches.map(r => [r.name, { tabelog_url: r.tabelog_url, tabelog_score: r.tabelog_score }]),
+    );
+
+    console.log(`[tablecheck-search] enrichment: ${names.length} restaurants, ${dbMatches.length} DB matches, SERPER_API_KEY=${process.env.SERPER_API_KEY ? 'set' : 'NOT SET'}`);
+
+    const uncoveredNames = names.filter(n => !scoreByName.has(n));
+    if (uncoveredNames.length > 0) {
+      console.log(`[tablecheck-search] looking up ${uncoveredNames.length} names via Tabelog cache/Serper: ${uncoveredNames.slice(0, 5).join(', ')}${uncoveredNames.length > 5 ? '...' : ''}`);
+      const cacheMatches = await lookupScoresByName(uncoveredNames, cityKey);
+      for (const [name, data] of cacheMatches) {
+        scoreByName.set(name, data);
+      }
+      const withScores = [...cacheMatches.values()].filter(d => d.tabelog_score !== null).length;
+      console.log(`[tablecheck-search] lookup results: ${cacheMatches.size} matched, ${withScores} with scores`);
+    }
+
+    // Stream results per-date (matching tabelog search format)
+    const emittedUrls = new Set<string>();
+    for (const date of sortedDates) {
+      if (clientGone) return;
+
+      const available: string[] = [];
+      const dateRestaurants: (typeof result.restaurants)[0][] = [];
+      const dateTimeSlots: Record<string, string[]> = {};
+
+      for (const r of result.restaurants) {
+        if (r.available_dates.includes(date)) {
+          available.push(r.tablecheck_url);
+          if (!emittedUrls.has(r.tablecheck_url)) {
+            emittedUrls.add(r.tablecheck_url);
+            dateRestaurants.push(r);
+          }
+          if (r.time_slots[date]?.length) {
+            dateTimeSlots[r.tablecheck_url] = r.time_slots[date]!;
+          }
+        }
+      }
+
+      console.log(`[tablecheck-search]   ${date}: ${available.length} available`);
+
+      res.write(JSON.stringify({
+        type: 'date',
+        date,
+        available,
+        restaurants: dateRestaurants.map(r => {
+          const match = scoreByName.get(r.name);
+          const cached = getCachedPlatformLinks(r.name, cityKey);
+          return {
+            name: r.name,
+            name_ja: null,
+            tabelog_url: match?.tabelog_url || null,
+            tablecheck_url: r.tablecheck_url,
+            tableall_url: cached?.tableall_url || null,
+            omakase_url: cached?.omakase_url || null,
+            tabelog_score: match?.tabelog_score || null,
+            cuisine: r.cuisine,
+            area: null,
+            city: null,
+            price_range: r.price_range,
+            image_url: r.image_url,
+            has_online_reservation: true,
+          };
+        }),
+        timeSlots: dateTimeSlots,
+      }) + '\n');
+    }
+
+    console.log(`[tablecheck-search] total restaurants: ${result.restaurants.length}`);
+    if (!clientGone) {
+      res.write(JSON.stringify({ type: 'done', totalRestaurants: result.restaurants.length }) + '\n');
+    }
+
+    // Background: discover platform links for restaurants without cached links
+    const toDiscover = result.restaurants
+      .filter(r => r.name && !getCachedPlatformLinks(r.name, cityKey));
+    if (toDiscover.length > 0 && !clientGone) {
+      console.log(`[tablecheck-search] discovering platform links for ${toDiscover.length} restaurants`);
+      const DISCOVER_CONCURRENCY = 3;
+      for (let i = 0; i < toDiscover.length && !clientGone; i += DISCOVER_CONCURRENCY) {
+        const batch = toDiscover.slice(i, i + DISCOVER_CONCURRENCY);
+        const results = await Promise.all(batch.map(async r => {
+          // TableCheck results don't have area/address — fall back to city-level search
+          const links = await discoverPlatformLinks(r.name, cityKey);
+          const match = scoreByName.get(r.name);
+          return { ...links, tabelog_url: match?.tabelog_url || null, name: r.name, tablecheck_url: r.tablecheck_url };
+        }));
+        const withLinks = results.filter(r => r.tableall_url || r.omakase_url);
+        if (withLinks.length > 0 && !clientGone) {
+          res.write(JSON.stringify({ type: 'platform-update', restaurants: withLinks }) + '\n');
+        }
+      }
+    }
+
+    res.end();
+  } catch (error) {
+    console.error('[tablecheck-search] failed', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'TableCheck search failed', details: String(error) });
+    } else if (!clientGone) {
+      res.write(JSON.stringify({ type: 'error', error: String(error) }) + '\n');
+      res.end();
+    }
+  }
+});
+
+// On-demand platform link discovery for a saved restaurant
+availabilityRouter.post('/discover-platforms/:id', async (req, res) => {
+  const { id } = req.params;
+  const restaurant = db.prepare('SELECT id, name, city, area, address, phone, tabelog_url, tablecheck_url, omakase_url, tableall_url FROM restaurants WHERE id = ?').get(id) as {
+    id: string; name: string; city: string | null; area: string | null; address: string | null; phone: string | null;
+    tabelog_url: string | null; tablecheck_url: string | null; omakase_url: string | null; tableall_url: string | null;
+  } | undefined;
+
+  if (!restaurant) {
+    res.status(404).json({ error: 'Restaurant not found' });
+    return;
+  }
+
+  try {
+    const { discoverPlatformLinks } = await import('../lib/scrapers/tabelog.js');
+    const links = await discoverPlatformLinks(restaurant.name, restaurant.city || 'tokyo', restaurant.area, restaurant.address, restaurant.phone, restaurant.tabelog_url);
+
+    // Update DB — only fill in missing URLs (don't overwrite existing)
+    db.prepare(
+      `UPDATE restaurants SET
+        tablecheck_url = COALESCE(tablecheck_url, ?),
+        omakase_url = COALESCE(omakase_url, ?),
+        tableall_url = COALESCE(tableall_url, ?)
+      WHERE id = ?`
+    ).run(links.tablecheck_url, links.omakase_url, links.tableall_url, id);
+
+    res.json({
+      tablecheck_url: restaurant.tablecheck_url || links.tablecheck_url,
+      omakase_url: restaurant.omakase_url || links.omakase_url,
+      tableall_url: restaurant.tableall_url || links.tableall_url,
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Platform discovery failed', details: String(error) });
+  }
+});
+
+// Name-based platform discovery — streams NDJSON progress for each restaurant
+availabilityRouter.post('/discover-platforms', async (req, res) => {
+  const { names, city, restaurants: restaurantMeta } = req.body as {
+    names: string[];
+    city?: string;
+    restaurants?: Record<string, { area?: string; address?: string; tabelogUrl?: string }>;
+  };
+  if (!names?.length) {
+    res.status(400).json({ error: 'names[] is required' });
+    return;
+  }
+
+  // Stream NDJSON so the client gets real-time progress
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let clientGone = false;
+  res.on('close', () => { clientGone = true; });
+
+  const total = names.length;
+  let completed = 0;
+  let found = 0;
+
+  // Look up phone numbers from DB for restaurants that have been saved
+  const phoneLookup = new Map<string, string>();
+  if (names.length > 0) {
+    const placeholders = names.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT name, phone FROM restaurants WHERE name IN (${placeholders}) AND phone IS NOT NULL`).all(...names) as { name: string; phone: string }[];
+    for (const r of rows) phoneLookup.set(r.name, r.phone);
+  }
+
+  console.log(`[discover-platforms] START — ${total} restaurants, city=${city || 'tokyo'}, with area data: ${restaurantMeta ? Object.keys(restaurantMeta).length : 0}, phone from DB: ${phoneLookup.size}`);
+
+  try {
+    const { discoverPlatformLinks } = await import('../lib/scrapers/tabelog.js');
+    const cityKey = (city || 'tokyo').toLowerCase();
+    const BATCH_SIZE = 3;
+
+    for (let i = 0; i < names.length && !clientGone; i += BATCH_SIZE) {
+      const batch = names.slice(i, i + BATCH_SIZE);
+      await Promise.all(batch.map(async (name) => {
+        if (clientGone) return;
+
+        // Stream progress before starting
+        if (!clientGone) {
+          res.write(JSON.stringify({ type: 'progress', current: completed + 1, total, name }) + '\n');
+        }
+
+        const meta = restaurantMeta?.[name];
+        const phone = phoneLookup.get(name) || null;
+        const links = await discoverPlatformLinks(name, cityKey, meta?.area, meta?.address, phone, meta?.tabelogUrl);
+        completed++;
+
+        const hasLinks = !!(links.tablecheck_url || links.omakase_url || links.tableall_url);
+        if (hasLinks) found++;
+
+        console.log(`[discover-platforms] (${completed}/${total}) "${name}" → TC=${links.tablecheck_url ? 'yes' : 'no'} OM=${links.omakase_url ? 'yes' : 'no'} TA=${links.tableall_url ? 'yes' : 'no'}`);
+
+        // Stream result for this restaurant
+        if (!clientGone) {
+          res.write(JSON.stringify({ type: 'result', name, links }) + '\n');
+        }
+      }));
+    }
+
+    console.log(`[discover-platforms] DONE — ${completed}/${total} checked, ${found} with platform links`);
+    if (!clientGone) {
+      res.write(JSON.stringify({ type: 'done', total: completed, found }) + '\n');
+    }
+    res.end();
+  } catch (error) {
+    console.error('[discover-platforms] FAIL', error);
+    if (!clientGone) {
       res.write(JSON.stringify({ type: 'error', error: String(error) }) + '\n');
       res.end();
     }

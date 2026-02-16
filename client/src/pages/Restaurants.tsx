@@ -38,6 +38,8 @@ export interface TabelogResult {
   name_ja: string | null;
   tabelog_url: string | null;
   tableall_url?: string | null;
+  tablecheck_url?: string | null;
+  omakase_url?: string | null;
   tabelog_score: number | null;
   cuisine: string | null;
   area: string | null;
@@ -117,6 +119,7 @@ export default function Restaurants() {
   const [showSpotsOpenOnly, setShowSpotsOpenOnly] = useState(false);
   const [showTabelog, setShowTabelog] = useState(true);
   const [showTableAll, setShowTableAll] = useState(true);
+  const [showTableCheck, setShowTableCheck] = useState(true);
   const [filterDateFrom, setFilterDateFrom] = useState('');
   const [filterDateTo, setFilterDateTo] = useState('');
   const [filterMeals, setFilterMeals] = useState<Set<'lunch' | 'dinner'>>(new Set());
@@ -133,6 +136,10 @@ export default function Restaurants() {
   const availProcessingRef = useRef(false);
   const pendingFilterKeyRef = useRef<string | null>(null);
   const pendingFilterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [discoveringPlatforms, setDiscoveringPlatforms] = useState<Set<string>>(new Set());
+  const [discoverProgress, setDiscoverProgress] = useState<{ current: number; total: number; name: string } | null>(null);
+  const discoverAbortRef = useRef<AbortController | null>(null);
+  const [pendingDiscover, setPendingDiscover] = useState(false);
 
   const MIN_FILTERED = 20;
   const MAX_PAGES = 10; // safety limit per sort mode
@@ -181,7 +188,7 @@ export default function Restaurants() {
   }, [showBookableOnly, showSpotsOpenOnly, filterDateFrom, filterMeals, filterPartySize]);
 
   const effectiveDateFilterKey = effectiveDateFilter
-    ? `${city}:${effectiveDateFilter.svd}:${filterDateTo || ''}:${effectiveDateFilter.svt || ''}:${effectiveDateFilter.svps || ''}:tl=${showTabelog}:ta=${showTableAll}`
+    ? `${city}:${effectiveDateFilter.svd}:${filterDateTo || ''}:${effectiveDateFilter.svt || ''}:${effectiveDateFilter.svps || ''}:tl=${showTabelog}:ta=${showTableAll}:tc=${showTableCheck}`
     : '';
   const dateFilterBrowsedRef = useRef(effectiveDateFilterKey);
 
@@ -199,10 +206,14 @@ export default function Restaurants() {
       setSavedUrls(new Set(r.flatMap(x => [
         x.tabelog_url ? normalizeUrl(x.tabelog_url) : '',
         x.tableall_url || '',
+        x.tablecheck_url || '',
+        x.omakase_url || '',
       ]).filter(Boolean)));
       setFavoriteUrls(new Set(r.filter(x => x.is_favorite).flatMap(x => [
         x.tabelog_url ? normalizeUrl(x.tabelog_url) : '',
         x.tableall_url || '',
+        x.tablecheck_url || '',
+        x.omakase_url || '',
       ]).filter(Boolean)));
     }).finally(() => setSavedLoading(false));
   };
@@ -212,12 +223,14 @@ export default function Restaurants() {
       setTrips(t);
       const active = t.find(x => (x as { is_active?: number }).is_active);
       if (active) {
-        api<{ restaurants: { tabelog_url: string | null; tableall_url?: string | null }[] }>(`/trips/${active.id}`).then(trip => {
+        api<{ restaurants: { tabelog_url: string | null; tableall_url?: string | null; tablecheck_url?: string | null; omakase_url?: string | null }[] }>(`/trips/${active.id}`).then(trip => {
           setTripRestaurantUrls(new Set(
             trip.restaurants
               .flatMap(r => [
                 r.tabelog_url ? normalizeUrl(r.tabelog_url) : '',
                 r.tableall_url || '',
+                r.tablecheck_url || '',
+                r.omakase_url || '',
               ])
               .filter(Boolean)
           ));
@@ -247,6 +260,12 @@ export default function Restaurants() {
     if (searchParams.get('tab') === 'browse') {
       setTab('browse');
       setSearchParams({}, { replace: true });
+    }
+    if (searchParams.get('action') === 'discover-platforms') {
+      setTab('browse');
+      setSearchParams({}, { replace: true });
+      setPendingDiscover(true);
+      console.log('[discover-platforms] Cmd+K trigger: pendingDiscover set');
     }
   }, [searchParams, setSearchParams]);
 
@@ -344,7 +363,7 @@ export default function Restaurants() {
       .finally(() => setBrowseLoading(false));
   };
 
-  const isFiltering = selectedCuisines.size > 0 || showBookableOnly || showSpotsOpenOnly || !showTabelog || !showTableAll;
+  const isFiltering = selectedCuisines.size > 0 || showBookableOnly || showSpotsOpenOnly || !showTabelog || !showTableAll || !showTableCheck;
 
   // Collect unique cuisines: start with common set, merge in discovered ones from results
   const availableCuisines = [...new Set([
@@ -381,7 +400,15 @@ export default function Restaurants() {
       if (a) return a;
     }
     if (r.tableall_url) {
-      return availabilityMap.get(r.tableall_url);
+      const a = availabilityMap.get(r.tableall_url);
+      if (a) return a;
+    }
+    if (r.tablecheck_url) {
+      const a = availabilityMap.get(r.tablecheck_url);
+      if (a) return a;
+    }
+    if (r.omakase_url) {
+      return availabilityMap.get(r.omakase_url);
     }
     return undefined;
   };
@@ -399,8 +426,9 @@ export default function Restaurants() {
   const filteredResults = isFiltering
     ? allResults.filter(r => {
         // Source filter
-        if (!showTabelog && r.tabelog_url && !r.tableall_url) return false;
-        if (!showTableAll && r.tableall_url) return false;
+        if (!showTabelog && r.tabelog_url && !r.tableall_url && !r.tablecheck_url) return false;
+        if (!showTableAll && r.tableall_url && !r.tablecheck_url) return false;
+        if (!showTableCheck && r.tablecheck_url && !r.tableall_url && !r.tabelog_url) return false;
         if (selectedCuisines.size > 0 && !matchesCuisine(r)) return false;
         if (showBookableOnly) {
           // Use inline data from browse (instant — no separate check needed)
@@ -435,7 +463,7 @@ export default function Restaurants() {
     : allResults;
   const anyBookable = cuisineFiltered.some(r => r.has_online_reservation);
   const uncheckedCount = cuisineFiltered.filter(r => {
-    const url = r.tabelog_url || r.tableall_url;
+    const url = r.tabelog_url || r.tableall_url || r.tablecheck_url;
     if (!url) return false;
     const key = r.tabelog_url ? normalizeUrl(r.tabelog_url) : url;
     if (availabilityMap.has(key)) return false;
@@ -548,16 +576,18 @@ export default function Restaurants() {
 
               if (dateRestaurants.length > 0) {
                 setAllResults(prev => {
-                  // Build set of ALL known URLs (both tabelog and tableall) for robust dedup
+                  // Build set of ALL known URLs (tabelog, tableall, tablecheck) for robust dedup
                   const existingUrls = new Set<string>();
                   for (const x of prev) {
                     if (x.tabelog_url) existingUrls.add(normalizeUrl(x.tabelog_url));
                     if (x.tableall_url) existingUrls.add(x.tableall_url);
+                    if (x.tablecheck_url) existingUrls.add(x.tablecheck_url);
                   }
                   const newOnes = dateRestaurants.filter((r: TabelogResult) => {
                     if (r.tabelog_url && existingUrls.has(normalizeUrl(r.tabelog_url))) return false;
                     if (r.tableall_url && existingUrls.has(r.tableall_url)) return false;
-                    return !!(r.tabelog_url || r.tableall_url);
+                    if (r.tablecheck_url && existingUrls.has(r.tablecheck_url)) return false;
+                    return !!(r.tabelog_url || r.tableall_url || r.tablecheck_url);
                   });
                   return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
                 });
@@ -567,11 +597,12 @@ export default function Restaurants() {
                 const next = new Map(prev);
                 const availableSet = new Set(available.map(u => u.includes('tabelog.com') ? normalizeUrl(u) : u));
 
+                const labelDomain = label === 'tableall' ? 'tableall.com'
+                  : label === 'tablecheck' ? 'tablecheck.com'
+                  : 'tabelog.com';
                 const allKnownUrls = new Set([
                   ...available,
-                  ...Array.from(prev.keys()).filter(k =>
-                    label === 'tableall' ? k.includes('tableall.com') : k.includes('tabelog.com')
-                  ),
+                  ...Array.from(prev.keys()).filter(k => k.includes(labelDomain)),
                 ]);
                 for (const url of allKnownUrls) {
                   const key = url.includes('tabelog.com') ? normalizeUrl(url) : url;
@@ -599,6 +630,30 @@ export default function Restaurants() {
                 }
                 return next;
               });
+            } else if (msg.type === 'platform-update') {
+              // Enrich existing results with discovered platform links
+              const updates = msg.restaurants as { tabelog_url?: string; name?: string; tablecheck_url?: string | null; omakase_url?: string | null; tableall_url?: string | null }[];
+              console.log(`[${label}] platform-update: ${updates.length} restaurants enriched`);
+              const mergePlatformLinks = (prev: TabelogResult[]) => {
+                let changed = false;
+                const updated = prev.map(r => {
+                  const match = updates.find(u =>
+                    (u.tabelog_url && r.tabelog_url && normalizeUrl(u.tabelog_url) === normalizeUrl(r.tabelog_url)) ||
+                    (u.name && r.name && u.name === r.name)
+                  );
+                  if (match) {
+                    const merged = { ...r };
+                    if (match.tablecheck_url && !r.tablecheck_url) { merged.tablecheck_url = match.tablecheck_url; changed = true; }
+                    if (match.omakase_url && !r.omakase_url) { merged.omakase_url = match.omakase_url; changed = true; }
+                    if (match.tableall_url && !r.tableall_url) { merged.tableall_url = match.tableall_url; changed = true; }
+                    return merged;
+                  }
+                  return r;
+                });
+                return changed ? updated : prev;
+              };
+              setAllResults(mergePlatformLinks);
+              setBrowseResults(mergePlatformLinks);
             } else if (msg.type === 'done') {
               console.log(`[${label}] stream done: ${msg.totalRestaurants} total restaurants`);
             }
@@ -634,10 +689,22 @@ export default function Restaurants() {
         );
       }
 
+      if (showTableCheck) {
+        searches.push(
+          fetch('/api/availability/search-tablecheck', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dates: datesToSearch, city, partySize: filterPartySize, meal }),
+            signal: abortController.signal,
+          }).then(r => processNDJSONStream(r, 'tablecheck'))
+            .catch(err => { if (err.name !== 'AbortError') console.error('[batch-avail] tablecheck search failed:', err); })
+        );
+      }
+
       Promise.all(searches).finally(() => {
         batchSearchRunningRef.current = false;
         setAvailChecking(false);
-        // Cross-match: enrich TableAll entries with Tabelog scores from parallel results
+        // Cross-match: enrich TableAll/TableCheck entries with Tabelog scores from parallel results
         setAllResults(prev => {
           const scoreByName = new Map<string, number>();
           for (const r of prev) {
@@ -645,7 +712,7 @@ export default function Restaurants() {
           }
           let changed = false;
           const updated = prev.map(r => {
-            if (!r.tabelog_score && r.tableall_url && r.name && scoreByName.has(r.name)) {
+            if (!r.tabelog_score && (r.tableall_url || r.tablecheck_url) && r.name && scoreByName.has(r.name)) {
               changed = true;
               return { ...r, tabelog_score: scoreByName.get(r.name)! };
             }
@@ -745,7 +812,7 @@ export default function Restaurants() {
   // Save a browse result and immediately favorite it
   const saveAndFavorite = async (r: TabelogResult) => {
     if (!r.name) return;
-    const primaryUrl = r.tabelog_url || r.tableall_url || null;
+    const primaryUrl = r.tabelog_url || r.tableall_url || r.tablecheck_url || null;
     setSavingUrl(primaryUrl);
     if (primaryUrl) triggerFavoriteAnimation(primaryUrl);
     try {
@@ -756,6 +823,8 @@ export default function Restaurants() {
           name_ja: r.name_ja,
           tabelog_url: r.tabelog_url,
           tableall_url: r.tableall_url,
+          tablecheck_url: r.tablecheck_url,
+          omakase_url: r.omakase_url,
           tabelog_score: r.tabelog_score,
           cuisine: r.cuisine,
           area: r.area,
@@ -772,6 +841,118 @@ export default function Restaurants() {
       setSavingUrl(null);
     }
   };
+
+  // Discover platform links for one or more restaurants by name (streaming NDJSON)
+  const discoverPlatforms = useCallback(async (names: string[]) => {
+    if (names.length === 0) return;
+
+    // Abort any in-flight discovery
+    discoverAbortRef.current?.abort();
+    const abort = new AbortController();
+    discoverAbortRef.current = abort;
+
+    setDiscoveringPlatforms(new Set(names));
+    setDiscoverProgress({ current: 0, total: names.length, name: '' });
+    console.log(`[discover-platforms] starting for ${names.length} restaurants`);
+
+    // Build metadata from allResults for more accurate platform matching
+    const restaurants: Record<string, { area?: string; tabelogUrl?: string }> = {};
+    for (const n of names) {
+      const r = allResults.find(x => x.name === n);
+      if (r?.area || r?.tabelog_url) {
+        restaurants[n] = {};
+        if (r.area) restaurants[n].area = r.area;
+        if (r.tabelog_url) restaurants[n].tabelogUrl = r.tabelog_url;
+      }
+    }
+
+    try {
+      const res = await fetch('/api/availability/discover-platforms', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ names, city, restaurants: Object.keys(restaurants).length > 0 ? restaurants : undefined }),
+        signal: abort.signal,
+      });
+
+      console.log(`[discover-platforms] fetch response: status=${res.status} type=${res.headers.get('content-type')} body=${!!res.body}`);
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => '(unreadable)');
+        console.error('[discover-platforms] bad response:', res.status, text);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || ''; // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (msg.type === 'progress') {
+              setDiscoverProgress({ current: msg.current, total: msg.total, name: msg.name });
+              console.log(`[discover-platforms] progress: ${msg.current}/${msg.total} — "${msg.name}"`);
+            } else if (msg.type === 'result') {
+              const { name: rName, links } = msg as { name: string; links: { tablecheck_url: string | null; omakase_url: string | null; tableall_url: string | null } };
+              console.log(`[discover-platforms] result: "${rName}" TC=${links.tablecheck_url || 'null'} OM=${links.omakase_url || 'null'} TA=${links.tableall_url || 'null'}`);
+              // Update both allResults and browseResults (table renders browseResults when no filters active)
+              const mergeLinks = (prev: TabelogResult[]) => {
+                const matched = prev.filter(r => r.name === rName);
+                console.log(`[discover-platforms] mergeLinks: "${rName}" found ${matched.length} match(es) in ${prev.length} results`);
+                return prev.map(r => {
+                  if (r.name !== rName) return r;
+                  const merged = { ...r };
+                  if (links.tablecheck_url) merged.tablecheck_url = links.tablecheck_url;
+                  if (links.omakase_url) merged.omakase_url = links.omakase_url;
+                  if (links.tableall_url) merged.tableall_url = links.tableall_url;
+                  return merged;
+                });
+              };
+              setAllResults(mergeLinks);
+              setBrowseResults(mergeLinks);
+              // Remove from discovering set
+              setDiscoveringPlatforms(prev => { const next = new Set(prev); next.delete(rName); return next; });
+            } else if (msg.type === 'done') {
+              console.log(`[discover-platforms] done: ${msg.total} checked, ${msg.found} with links`);
+            } else if (msg.type === 'error') {
+              console.error('[discover-platforms] server error:', msg.error);
+            }
+          } catch { /* skip malformed lines */ }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== 'AbortError') {
+        console.error('[discover-platforms] failed:', err);
+      }
+    } finally {
+      setDiscoveringPlatforms(new Set());
+      setDiscoverProgress(null);
+      discoverAbortRef.current = null;
+    }
+  }, [city, allResults]);
+
+  // Handle pending discover-platforms action (triggered via Cmd+K)
+  useEffect(() => {
+    if (!pendingDiscover || browseLoading || allResults.length === 0) return;
+    setPendingDiscover(false);
+    const names = allResults
+      .filter(r => r.name && (r.tabelog_score ?? 0) >= 3.7 && !r.tablecheck_url && !r.tableall_url && !r.omakase_url)
+      .map(r => r.name!);
+    console.log(`[discover-platforms] trigger fired: ${allResults.length} results, ${names.length} eligible (3.7+ without platform URLs)`);
+    if (names.length > 0) {
+      discoverPlatforms(names);
+    } else {
+      console.log('[discover-platforms] no eligible restaurants found');
+    }
+  }, [pendingDiscover, allResults, browseLoading, discoverPlatforms]);
 
   const quickAddToTrip = useCallback(async (restaurants: (Restaurant | TabelogResult)[]) => {
     const activeTrip = trips.find(t => (t as { is_active?: number }).is_active);
@@ -1196,7 +1377,7 @@ export default function Restaurants() {
             if (!item) return false;
             return 'id' in item
               ? !!(item as Restaurant).is_favorite
-              : !!((item.tabelog_url && favoriteUrls.has(normalizeUrl(item.tabelog_url))) || (item.tableall_url && favoriteUrls.has(item.tableall_url)));
+              : !!((item.tabelog_url && favoriteUrls.has(normalizeUrl(item.tabelog_url))) || (item.tableall_url && favoriteUrls.has(item.tableall_url)) || (item.tablecheck_url && favoriteUrls.has(item.tablecheck_url)));
           })()}
           isSaving={savingUrl === currentList[detailIndex]?.tabelog_url}
           favoriteAnimating={(() => {
@@ -1552,7 +1733,7 @@ export default function Restaurants() {
                 <div className="mb-4 flex items-center gap-2 flex-wrap">
                   <span className="text-xs font-medium text-gray-500 uppercase mr-1">Source:</span>
                   <button
-                    onClick={() => { if (!showTabelog || showTableAll) setShowTabelog(v => !v); }}
+                    onClick={() => { if (!showTabelog || showTableAll || showTableCheck) setShowTabelog(v => !v); }}
                     className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
                       showTabelog
                         ? 'bg-amber-500 text-white'
@@ -1562,7 +1743,7 @@ export default function Restaurants() {
                     Tabelog
                   </button>
                   <button
-                    onClick={() => { if (!showTableAll || showTabelog) setShowTableAll(v => !v); }}
+                    onClick={() => { if (!showTableAll || showTabelog || showTableCheck) setShowTableAll(v => !v); }}
                     className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
                       showTableAll
                         ? 'bg-purple-600 text-white'
@@ -1570,6 +1751,16 @@ export default function Restaurants() {
                     }`}
                   >
                     TableAll
+                  </button>
+                  <button
+                    onClick={() => { if (!showTableCheck || showTabelog || showTableAll) setShowTableCheck(v => !v); }}
+                    className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
+                      showTableCheck
+                        ? 'bg-teal-600 text-white'
+                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    TableCheck
                   </button>
                   <span className="mx-1 text-gray-300">|</span>
                   <span className="text-xs font-medium text-gray-500 uppercase mr-1">Booking:</span>
@@ -1643,7 +1834,21 @@ export default function Restaurants() {
                 const needsDateChecks = showSpotsOpenOnly && !effectiveDateFilter;
                 const batchSearching = showSpotsOpenOnly && effectiveDateFilter && availChecking;
                 const stillSearching = batchSearching || (needsDateChecks && (availChecking || fetchingMore || uncheckedCount > 0 || (filteredResults.length < MIN_FILTERED && canLoadMore)));
-                return browseLoading ? (
+                return (<>
+                  {discoverProgress && (
+                    <div className="mb-3 flex items-center gap-3 px-4 py-2.5 bg-blue-50 border border-blue-200 rounded-lg text-sm">
+                      <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin shrink-0" />
+                      <span className="text-blue-800">
+                        Discovering platforms: <span className="font-medium">{discoverProgress.current}</span> / {discoverProgress.total}
+                        {discoverProgress.name && <> — &ldquo;{discoverProgress.name}&rdquo;</>}
+                      </span>
+                      <button
+                        onClick={() => discoverAbortRef.current?.abort()}
+                        className="ml-auto text-xs text-blue-600 hover:text-blue-800 font-medium"
+                      >Cancel</button>
+                    </div>
+                  )}
+                  {browseLoading ? (
                   <div className="text-center py-12">
                     <div className="inline-block w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
                     <p className="mt-2 text-sm text-gray-500">Loading restaurants from Tabelog...</p>
@@ -1714,10 +1919,10 @@ export default function Restaurants() {
                       </thead>
                       <tbody className="divide-y divide-gray-200">
                         {filteredResults.map((r, idx) => {
-                          const primaryUrl = r.tabelog_url || r.tableall_url;
-                          const isItemSaved = (r.tabelog_url && savedUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && savedUrls.has(r.tableall_url)) || false;
+                          const primaryUrl = r.tabelog_url || r.tableall_url || r.tablecheck_url || r.omakase_url;
+                          const isItemSaved = (r.tabelog_url && savedUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && savedUrls.has(r.tableall_url)) || (r.tablecheck_url && savedUrls.has(r.tablecheck_url)) || (r.omakase_url && savedUrls.has(r.omakase_url)) || false;
                           const isSaving = savingUrl === primaryUrl;
-                          const isInTrip = (r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url)) || false;
+                          const isInTrip = (r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url)) || (r.tablecheck_url && tripRestaurantUrls.has(r.tablecheck_url)) || (r.omakase_url && tripRestaurantUrls.has(r.omakase_url)) || false;
                           const isSelected = selectedRows.has(idx);
                           return (
                             <tr
@@ -1741,7 +1946,36 @@ export default function Restaurants() {
                                       onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }} />
                                   )}
                                   <div>
-                                    <div className="text-sm font-medium text-gray-900">{r.name || 'Unknown'}</div>
+                                    <div className="text-sm font-medium text-gray-900 flex items-center gap-1.5">
+                                      {r.name || 'Unknown'}
+                                      {r.tablecheck_url && (
+                                        <a href={r.tablecheck_url} target="_blank" rel="noopener noreferrer"
+                                          onClick={e => e.stopPropagation()}
+                                          className="inline-flex items-center px-1 py-0.5 rounded text-[10px] font-semibold bg-teal-50 text-teal-700 hover:bg-teal-100"
+                                          title="Book on TableCheck">TC</a>
+                                      )}
+                                      {r.tableall_url && (
+                                        <a href={r.tableall_url} target="_blank" rel="noopener noreferrer"
+                                          onClick={e => e.stopPropagation()}
+                                          className="inline-flex items-center px-1 py-0.5 rounded text-[10px] font-semibold bg-purple-50 text-purple-700 hover:bg-purple-100"
+                                          title="Book on TableAll">TA</a>
+                                      )}
+                                      {r.omakase_url && (
+                                        <a href={r.omakase_url} target="_blank" rel="noopener noreferrer"
+                                          onClick={e => e.stopPropagation()}
+                                          className="inline-flex items-center px-1 py-0.5 rounded text-[10px] font-semibold bg-pink-50 text-pink-700 hover:bg-pink-100"
+                                          title="Book on Omakase">OM</a>
+                                      )}
+                                      {(r.tabelog_score ?? 0) >= 3.7 && !r.tablecheck_url && !r.tableall_url && !r.omakase_url && (
+                                        <button
+                                          onClick={e => { e.stopPropagation(); if (r.name) discoverPlatforms([r.name]); }}
+                                          disabled={!!(r.name && discoveringPlatforms.has(r.name))}
+                                          className="inline-flex items-center px-1 py-0.5 rounded text-[10px] font-semibold bg-gray-100 text-gray-500 hover:bg-gray-200 hover:text-gray-700 disabled:opacity-50"
+                                          title="Click to search for online booking platforms">
+                                          {r.name && discoveringPlatforms.has(r.name) ? '...' : 'Phone'}
+                                        </button>
+                                      )}
+                                    </div>
                                     {r.tabelog_url ? (
                                       <a href={r.tabelog_url} target="_blank" rel="noopener noreferrer"
                                         onClick={e => e.stopPropagation()}
@@ -1753,6 +1987,12 @@ export default function Restaurants() {
                                         onClick={e => e.stopPropagation()}
                                         className="text-xs text-purple-500 hover:text-purple-700">
                                         View on TableAll
+                                      </a>
+                                    ) : r.tablecheck_url ? (
+                                      <a href={r.tablecheck_url} target="_blank" rel="noopener noreferrer"
+                                        onClick={e => e.stopPropagation()}
+                                        className="text-xs text-teal-500 hover:text-teal-700">
+                                        View on TableCheck
                                       </a>
                                     ) : null}
                                   </div>
@@ -1828,7 +2068,7 @@ export default function Restaurants() {
                               )}
                               <td className="px-4 py-3 text-right">
                                 {(() => {
-                                  const isFav = (r.tabelog_url && favoriteUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && favoriteUrls.has(r.tableall_url));
+                                  const isFav = (r.tabelog_url && favoriteUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && favoriteUrls.has(r.tableall_url)) || (r.tablecheck_url && favoriteUrls.has(r.tablecheck_url)) || (r.omakase_url && favoriteUrls.has(r.omakase_url));
                                   const isAnimating = (r.tabelog_url && animatingFavorite === r.tabelog_url) || (r.tabelog_url && saved.find(s => s.tabelog_url && r.tabelog_url && normalizeUrl(s.tabelog_url) === normalizeUrl(r.tabelog_url))?.id === animatingFavorite);
                                   return (
                                     <button
@@ -1931,7 +2171,8 @@ export default function Restaurants() {
                     </div>
                   )}
                 </>
-              );
+              )}
+                </>);
               })()}
             </div>
           )}
@@ -1989,7 +2230,7 @@ export default function Restaurants() {
                           </td>
                           <td className="px-4 py-3 text-sm text-gray-500">{r.rank ?? idx + 1}</td>
                           <td className="px-1 py-3 text-center w-8">
-                            {((r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url))) && (
+                            {((r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url)) || (r.tablecheck_url && tripRestaurantUrls.has(r.tablecheck_url))) && (
                               <span className="text-teal-500 text-sm" title="In trip">●</span>
                             )}
                           </td>
@@ -2015,15 +2256,21 @@ export default function Restaurants() {
                           <td className="px-4 py-3 text-sm text-gray-600">{r.price_range || '—'}</td>
                           <td className="px-4 py-3">
                             <div className="flex gap-1">
-                              {[
-                                r.omakase_url && 'O',
-                                r.tablecheck_url && 'TC',
-                                r.tableall_url && 'TA',
-                              ].filter(Boolean).map(p => (
-                                <span key={p as string} className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
-                                  {p}
-                                </span>
-                              ))}
+                              {r.tablecheck_url && (
+                                <a href={r.tablecheck_url} target="_blank" rel="noopener noreferrer"
+                                  onClick={e => e.stopPropagation()}
+                                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-teal-50 text-teal-700 hover:bg-teal-100">TC</a>
+                              )}
+                              {r.tableall_url && (
+                                <a href={r.tableall_url} target="_blank" rel="noopener noreferrer"
+                                  onClick={e => e.stopPropagation()}
+                                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-50 text-purple-700 hover:bg-purple-100">TA</a>
+                              )}
+                              {r.omakase_url && (
+                                <a href={r.omakase_url} target="_blank" rel="noopener noreferrer"
+                                  onClick={e => e.stopPropagation()}
+                                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-pink-50 text-pink-700 hover:bg-pink-100">OM</a>
+                              )}
                               {!r.omakase_url && !r.tablecheck_url && !r.tableall_url && (
                                 <span className="text-gray-400 text-sm">—</span>
                               )}
