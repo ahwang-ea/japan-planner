@@ -42,7 +42,10 @@ CREATE TABLE IF NOT EXISTS trip_restaurants (
   day_assigned TEXT,
   meal TEXT,
   notes TEXT,
-  UNIQUE(trip_id, restaurant_id)
+  status TEXT NOT NULL DEFAULT 'potential',
+  booked_via TEXT,
+  auto_dates INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(trip_id, restaurant_id, day_assigned, meal)
 );
 
 CREATE TABLE IF NOT EXISTS booking_accounts (

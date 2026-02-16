@@ -57,19 +57,8 @@ export default function Trips() {
       const key = e.key;
       const maxIdx = trips.length - 1;
 
-      if (detailIndex !== null) {
-        if (key === 'Escape') { e.preventDefault(); setDetailIndex(null); }
-        else if (key === 'j' || key === 'ArrowDown') {
-          e.preventDefault();
-          setDetailIndex(i => Math.min((i ?? 0) + 1, maxIdx));
-          setSelectedRowIndex(i => Math.min(i + 1, maxIdx));
-        } else if (key === 'k' || key === 'ArrowUp') {
-          e.preventDefault();
-          setDetailIndex(i => Math.max((i ?? 0) - 1, 0));
-          setSelectedRowIndex(i => Math.max(i - 1, 0));
-        }
-        return;
-      }
+      // TripDetailPanel handles its own keyboard (j/k for rows, Esc to close)
+      if (detailIndex !== null) return;
 
       if (key === 'j' || key === 'ArrowDown') {
         e.preventDefault();

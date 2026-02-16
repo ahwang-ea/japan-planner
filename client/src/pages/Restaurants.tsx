@@ -96,6 +96,9 @@ export default function Restaurants() {
   const [favoriteUrls, setFavoriteUrls] = useState<Set<string>>(new Set());
   const [animatingFavorite, setAnimatingFavorite] = useState<string | null>(null);
   const [showTripModal, setShowTripModal] = useState(false);
+  const [selectedRows, setSelectedRows] = useState<Set<number>>(new Set());
+  const [quickAddFlash, setQuickAddFlash] = useState<string | null>(null);
+  const [tripRestaurantUrls, setTripRestaurantUrls] = useState<Set<string>>(new Set());
   const [cuisinePopoverOpen, setCuisinePopoverOpen] = useState(false);
   const [cuisineQuery, setCuisineQuery] = useState('');
   const [cuisineHighlightIdx, setCuisineHighlightIdx] = useState(0);
@@ -195,9 +198,25 @@ export default function Restaurants() {
     }).finally(() => setSavedLoading(false));
   };
 
+  const loadTripRestaurants = useCallback(() => {
+    api<typeof trips>('/trips').then(t => {
+      setTrips(t);
+      const active = t.find(x => (x as { is_active?: number }).is_active);
+      if (active) {
+        api<{ restaurants: { tabelog_url: string | null }[] }>(`/trips/${active.id}`).then(trip => {
+          setTripRestaurantUrls(new Set(
+            trip.restaurants
+              .map(r => r.tabelog_url ? normalizeUrl(r.tabelog_url) : '')
+              .filter(Boolean)
+          ));
+        }).catch(() => {});
+      }
+    }).catch(() => {});
+  }, []);
+
   useEffect(() => {
     loadSaved();
-    api<typeof trips>('/trips').then(setTrips).catch(() => {});
+    loadTripRestaurants();
   }, []);
 
   // Handle URL params from command palette
@@ -689,6 +708,73 @@ export default function Restaurants() {
     }
   };
 
+  const quickAddToTrip = useCallback(async (restaurants: (Restaurant | TabelogResult)[]) => {
+    const activeTrip = trips.find(t => (t as { is_active?: number }).is_active);
+    if (!activeTrip || restaurants.length === 0) {
+      setShowTripModal(true);
+      return;
+    }
+
+    let count = 0;
+    for (const r of restaurants) {
+      const avail = getAvail(r);
+      const tripDates: string[] = [];
+      const start = new Date(activeTrip.start_date + 'T12:00:00');
+      const end = new Date(activeTrip.end_date + 'T12:00:00');
+      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        tripDates.push(d.toISOString().slice(0, 10));
+      }
+
+      let bookableDates = tripDates;
+      if (avail?.dates?.length) {
+        const bookableSet = new Set(
+          avail.dates
+            .filter(d => (d.status === 'available' || d.status === 'limited') && tripDates.includes(d.date))
+            .map(d => d.date)
+        );
+        if (bookableSet.size > 0) bookableDates = [...bookableSet];
+      }
+
+      if (bookableDates.length === 0) continue;
+
+      let restaurantId: string;
+      if ('id' in r) {
+        restaurantId = (r as Restaurant).id;
+      } else {
+        const created = await api<Restaurant>('/restaurants', {
+          method: 'POST',
+          body: JSON.stringify({
+            name: r.name, name_ja: r.name_ja, tabelog_url: r.tabelog_url,
+            tabelog_score: r.tabelog_score, cuisine: r.cuisine, area: r.area,
+            city: r.city || city, price_range: r.price_range, image_url: r.image_url,
+          }),
+        });
+        restaurantId = created.id;
+      }
+
+      for (const date of bookableDates) {
+        for (const meal of ['lunch', 'dinner']) {
+          await api(`/trips/${activeTrip.id}/restaurants`, {
+            method: 'POST',
+            body: JSON.stringify({
+              restaurant_id: restaurantId, day_assigned: date, meal,
+              status: 'potential', auto_dates: true,
+            }),
+          });
+        }
+      }
+      count++;
+    }
+
+    loadSaved();
+    loadTripRestaurants();
+    setSelectedRows(new Set());
+    if (count > 0) {
+      setQuickAddFlash(`Added ${count} restaurant${count > 1 ? 's' : ''} to ${activeTrip.name}`);
+      setTimeout(() => setQuickAddFlash(null), 2500);
+    }
+  }, [trips, city, loadTripRestaurants]);
+
   const displayedSaved = useMemo(
     () => showFavoritesOnly ? saved.filter(r => r.is_favorite) : saved,
     [saved, showFavoritesOnly],
@@ -794,6 +880,10 @@ export default function Restaurants() {
             if (match) toggleFavorite(match.id);
             else saveAndFavorite(r as TabelogResult);
           }
+        } else if (key === 'T' && e.shiftKey) {
+          e.preventDefault();
+          const r = currentList[detailIndex];
+          if (r) quickAddToTrip([r]);
         } else if (key === 't') {
           e.preventDefault();
           setShowTripModal(true);
@@ -863,6 +953,34 @@ export default function Restaurants() {
       }
 
       // List view
+
+      // Shift+j/k/arrows = move + range-select
+      if (e.shiftKey && (key === 'J' || key === 'j' || key === 'ArrowDown')) {
+        e.preventDefault();
+        const next = Math.min(selectedRowIndex + 1, maxIdx);
+        setSelectedRowIndex(next);
+        setSelectedRows(prev => { const s = new Set(prev); s.add(selectedRowIndex); s.add(next); return s; });
+        return;
+      }
+      if (e.shiftKey && (key === 'K' || key === 'k' || key === 'ArrowUp')) {
+        e.preventDefault();
+        const next = Math.max(selectedRowIndex - 1, 0);
+        setSelectedRowIndex(next);
+        setSelectedRows(prev => { const s = new Set(prev); s.add(selectedRowIndex); s.add(next); return s; });
+        return;
+      }
+      // Space = toggle individual row in selection
+      if (key === ' ') {
+        e.preventDefault();
+        setSelectedRows(prev => {
+          const s = new Set(prev);
+          if (s.has(selectedRowIndex)) s.delete(selectedRowIndex);
+          else s.add(selectedRowIndex);
+          return s;
+        });
+        return;
+      }
+
       if (key === 'j' || key === 'ArrowDown') {
         e.preventDefault();
         setSelectedRowIndex(i => Math.min(i + 1, maxIdx));
@@ -882,17 +1000,29 @@ export default function Restaurants() {
       } else if (key === 'Enter' && selectedRowIndex >= 0 && selectedRowIndex < currentList.length) {
         e.preventDefault();
         setDetailIndex(selectedRowIndex);
+      } else if (key === 'T' && e.shiftKey && selectedRowIndex >= 0 && selectedRowIndex < currentList.length) {
+        e.preventDefault();
+        if (selectedRows.size > 0) {
+          quickAddToTrip([...selectedRows].sort().map(i => currentList[i]).filter(Boolean));
+        } else {
+          const r = currentList[selectedRowIndex];
+          if (r) quickAddToTrip([r]);
+        }
       } else if (key === 't' && selectedRowIndex >= 0 && selectedRowIndex < currentList.length) {
         e.preventDefault();
         setShowTripModal(true);
       } else if (key === 'Escape') {
         e.preventDefault();
-        setSelectedRowIndex(0);
+        if (selectedRows.size > 0) {
+          setSelectedRows(new Set());
+        } else {
+          setSelectedRowIndex(0);
+        }
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [tab, currentList, selectedRowIndex, detailIndex, showForm, navigate, saved, city, cuisinePopoverOpen, partySizePopoverOpen, tripPopoverOpen, availableCuisines]);
+  }, [tab, currentList, selectedRowIndex, detailIndex, showForm, navigate, saved, city, cuisinePopoverOpen, partySizePopoverOpen, tripPopoverOpen, availableCuisines, selectedRows, quickAddToTrip]);
 
   // Scroll selected row into view (only when list view is showing)
   useEffect(() => {
@@ -1390,6 +1520,31 @@ export default function Restaurants() {
                 </div>
               )}
 
+              {/* Active trip quick-add bar */}
+              {(() => {
+                const activeTrip = trips.find(t => (t as { is_active?: number }).is_active);
+                if (!activeTrip) return null;
+                return (
+                  <div className="mb-3 flex items-center justify-between px-3 py-2 bg-teal-50 border border-teal-200 rounded-lg">
+                    <span className="text-sm text-teal-700 flex items-center gap-2">
+                      Adding to: <strong>{activeTrip.name}</strong>
+                      {selectedRows.size > 0 && (
+                        <span className="text-teal-600 bg-teal-100 px-1.5 py-0.5 rounded text-xs font-medium">{selectedRows.size} selected</span>
+                      )}
+                      {quickAddFlash && (
+                        <span className="text-teal-800 bg-teal-200 px-2 py-0.5 rounded text-xs font-medium">{quickAddFlash}</span>
+                      )}
+                    </span>
+                    <span className="text-xs text-teal-600 flex items-center gap-3">
+                      <span><kbd className="px-1.5 py-0.5 bg-teal-100 rounded border border-teal-300 text-teal-700 font-medium">&#8679;T</kbd> quick-add all bookable</span>
+                      <span className="text-teal-300">|</span>
+                      <span><kbd className="px-1 py-0.5 bg-teal-100 rounded border border-teal-300 text-teal-600">&#8679;&#8593;/&#8595;</kbd> select</span>
+                      <span><kbd className="px-1 py-0.5 bg-teal-100 rounded border border-teal-300 text-teal-600">Space</kbd> toggle</span>
+                    </span>
+                  </div>
+                );
+              })()}
+
               {(() => {
                 const availFilterActive = showBookableOnly || showSpotsOpenOnly;
                 const rankedCanLoad = hasNextPage && lastFetchedPage < MAX_PAGES;
@@ -1455,6 +1610,7 @@ export default function Restaurants() {
                       <thead className="bg-gray-50">
                         <tr>
                           <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase w-12">#</th>
+                          <th className="w-8"></th>
                           <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Restaurant</th>
                           <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase w-20">Score</th>
                           <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Cuisine</th>
@@ -1473,15 +1629,22 @@ export default function Restaurants() {
                         {filteredResults.map((r, idx) => {
                           const isItemSaved = r.tabelog_url ? savedUrls.has(normalizeUrl(r.tabelog_url)) : false;
                           const isSaving = savingUrl === r.tabelog_url;
+                          const isInTrip = r.tabelog_url ? tripRestaurantUrls.has(normalizeUrl(r.tabelog_url)) : false;
+                          const isSelected = selectedRows.has(idx);
                           return (
                             <tr
                               key={r.tabelog_url || idx}
                               data-row-index={idx}
-                              className={`cursor-pointer ${idx === selectedRowIndex ? 'bg-blue-50 ring-1 ring-inset ring-blue-200' : 'hover:bg-gray-50'}`}
+                              className={`cursor-pointer ${
+                                isSelected ? 'bg-teal-50' : ''
+                              } ${idx === selectedRowIndex ? 'bg-blue-50 ring-1 ring-inset ring-blue-200' : isSelected ? '' : 'hover:bg-gray-50'}`}
                               onClick={() => { setSelectedRowIndex(idx); setDetailIndex(idx); }}
                             >
                               <td className="px-4 py-3 text-sm text-gray-400">
                                 {isFiltering ? idx + 1 : (browsePage - 1) * 20 + idx + 1}
+                              </td>
+                              <td className="px-1 py-3 text-center w-8">
+                                {isInTrip && <span className="text-teal-500 text-sm" title="In trip">●</span>}
                               </td>
                               <td className="px-4 py-3">
                                 <div className="flex items-center gap-3">
@@ -1602,10 +1765,20 @@ export default function Restaurants() {
                       </tbody>
                     </table>
                     <div className="px-4 py-2 border-t border-gray-100 bg-gray-50 flex items-center gap-3 text-xs text-gray-400 flex-wrap">
+                      {quickAddFlash && (
+                        <span className="text-teal-600 font-medium bg-teal-50 px-2 py-0.5 rounded">{quickAddFlash}</span>
+                      )}
+                      {selectedRows.size > 0 && (
+                        <span className="text-teal-600 font-medium">{selectedRows.size} selected</span>
+                      )}
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">j/k</kbd> navigate</span>
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">Enter</kbd> view</span>
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">f</kbd> fav</span>
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">t</kbd> trip</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">&#8679;T</kbd> quick-add</span>
+                      <span className="text-gray-300">|</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">&#8679;j/k</kbd> select</span>
+                      <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">Space</kbd> toggle</span>
                       <span className="text-gray-300">|</span>
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">1-9</kbd> city</span>
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">/</kbd> cuisine</span>
@@ -1693,6 +1866,7 @@ export default function Restaurants() {
                       <tr>
                         <th className="px-2 py-3 text-center text-xs font-medium text-gray-500 uppercase w-10"></th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">#</th>
+                        <th className="w-8"></th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Name</th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Score</th>
                         <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Cuisine</th>
@@ -1720,6 +1894,11 @@ export default function Restaurants() {
                             </button>
                           </td>
                           <td className="px-4 py-3 text-sm text-gray-500">{r.rank ?? idx + 1}</td>
+                          <td className="px-1 py-3 text-center w-8">
+                            {r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url)) && (
+                              <span className="text-teal-500 text-sm" title="In trip">●</span>
+                            )}
+                          </td>
                           <td className="px-4 py-3">
                             <div className="flex items-center gap-3">
                               {r.image_url && (
@@ -1727,9 +1906,7 @@ export default function Restaurants() {
                                   onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }} />
                               )}
                               <div>
-                                <span className="text-sm font-medium text-blue-600">
-                                  {r.name}
-                                </span>
+                                <span className="text-sm font-medium text-blue-600">{r.name}</span>
                                 {r.name_ja && <div className="text-xs text-gray-400">{r.name_ja}</div>}
                               </div>
                             </div>
@@ -1794,12 +1971,14 @@ export default function Restaurants() {
         const idx = detailIndex ?? selectedRowIndex;
         const r = currentList[idx];
         if (!r) return null;
+        const avail = getAvail(r);
         return (
           <AddToTripModal
             restaurant={r}
             city={city}
+            availability={avail ? { dates: avail.dates } : null}
             onClose={() => setShowTripModal(false)}
-            onAdded={() => { setShowTripModal(false); loadSaved(); }}
+            onAdded={() => { setShowTripModal(false); loadSaved(); loadTripRestaurants(); }}
           />
         );
       })()}
