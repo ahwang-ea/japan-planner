@@ -1,9 +1,15 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Load .env from project root (one level above server/)
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+
 import express from 'express';
 import cors from 'cors';
 import net from 'net';
 import fs from 'fs';
-import path from 'path';
 import { restaurantsRouter } from './routes/restaurants.js';
 import { tripsRouter } from './routes/trips.js';
 import { accountsRouter } from './routes/accounts.js';
@@ -46,6 +52,7 @@ async function start() {
   app.listen(port, () => {
     fs.writeFileSync(PORT_FILE, String(port));
     console.log(`Server running on http://localhost:${port}`);
+    console.log(`  SERPER_API_KEY: ${process.env.SERPER_API_KEY ? 'loaded (' + process.env.SERPER_API_KEY.slice(0, 6) + '...)' : 'NOT SET — platform discovery disabled'}`);
   });
 }
 

@@ -49,6 +49,7 @@ export default function Layout() {
     { id: 'action-add-restaurant', label: 'Add Restaurant', section: 'Actions', keywords: ['create', 'save', 'new', 'restaurant'], onSelect: () => navigate('/restaurants?action=add') },
     { id: 'action-browse', label: 'Browse Tabelog', section: 'Actions', keywords: ['search', 'tabelog', 'browse', 'find'], onSelect: () => navigate('/restaurants') },
     { id: 'action-favorites', label: 'View Favorites', section: 'Actions', keywords: ['favorite', 'starred', 'priority'], onSelect: () => navigate('/restaurants?filter=favorites') },
+    { id: 'action-discover-platforms', label: 'Discover Booking Platforms', section: 'Actions', keywords: ['discover', 'platform', 'tablecheck', 'omakase', 'tableall', 'booking', 'reserve', 'phone'], onSelect: () => navigate('/restaurants?action=discover-platforms&tab=browse') },
     ...restaurants.map(r => ({
       id: `restaurant-${r.id}`,
       label: r.name,
