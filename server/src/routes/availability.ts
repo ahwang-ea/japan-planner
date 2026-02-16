@@ -173,3 +173,118 @@ availabilityRouter.post('/search', async (req, res) => {
     }
   }
 });
+
+// TableAll date-range availability search
+// Streams results per-date as NDJSON (same format as /search) for the client to consume
+availabilityRouter.post('/search-tableall', async (req, res) => {
+  const { dates, area } = req.body;
+  if (!dates?.length) {
+    res.status(400).json({ error: 'dates[] is required' });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let clientGone = false;
+  res.on('close', () => { clientGone = true; });
+
+  try {
+    const { browseTableAll } = await import('../lib/scrapers/tableall.js');
+    const sortedDates = (dates as string[]).slice(0, 14).sort();
+    const dateFrom = sortedDates[0]!;
+    const dateTo = sortedDates[sortedDates.length - 1]!;
+
+    console.log(`[tableall-search] dates=${sortedDates.join(',')} area=${area || 'all'}`);
+
+    const result = await browseTableAll(dateFrom, dateTo, area || undefined);
+
+    if (clientGone) return;
+
+    // Enrich with Tabelog ratings — check DB first, then Tabelog browse cache
+    const names = result.restaurants.map(r => r.name);
+    const placeholders = names.map(() => '?').join(',');
+    const dbMatches = names.length > 0
+      ? db.prepare(`SELECT name, tabelog_url, tabelog_score FROM restaurants WHERE name IN (${placeholders})`).all(...names) as { name: string; tabelog_url: string | null; tabelog_score: number | null }[]
+      : [];
+    const scoreByName = new Map<string, { tabelog_url: string | null; tabelog_score: number | null }>(
+      dbMatches.map(r => [r.name, { tabelog_url: r.tabelog_url, tabelog_score: r.tabelog_score }]),
+    );
+
+    // Fallback: look up scores from Tabelog browse cache + Tabelog search
+    const uncoveredNames = names.filter(n => !scoreByName.has(n));
+    if (uncoveredNames.length > 0) {
+      const { lookupScoresByName } = await import('../lib/scrapers/tabelog.js');
+      const cacheMatches = await lookupScoresByName(uncoveredNames, (area || 'tokyo').toLowerCase());
+      for (const [name, data] of cacheMatches) {
+        scoreByName.set(name, data);
+      }
+    }
+
+    // Build a per-date index: for each requested date, which restaurants are available?
+    const allRestaurantsByUrl = new Map<string, (typeof result.restaurants)[0]>();
+    for (const r of result.restaurants) {
+      allRestaurantsByUrl.set(r.tableall_url, r);
+    }
+
+    // Stream results per-date (matching tabelog search format)
+    const emittedUrls = new Set<string>();
+    for (const date of sortedDates) {
+      if (clientGone) return;
+
+      const available: string[] = [];
+      const dateRestaurants: (typeof result.restaurants)[0][] = [];
+
+      for (const r of result.restaurants) {
+        if (r.available_dates.includes(date)) {
+          available.push(r.tableall_url);
+          if (!emittedUrls.has(r.tableall_url)) {
+            emittedUrls.add(r.tableall_url);
+            dateRestaurants.push(r);
+          }
+        }
+      }
+
+      console.log(`[tableall-search]   ${date}: ${available.length} available`);
+
+      res.write(JSON.stringify({
+        type: 'date',
+        date,
+        available,
+        restaurants: dateRestaurants.map(r => {
+          const match = scoreByName.get(r.name);
+          return {
+            name: r.name,
+            name_ja: null,
+            tabelog_url: match?.tabelog_url || null,
+            tableall_url: r.tableall_url,
+            tabelog_score: match?.tabelog_score || null,
+            cuisine: r.cuisine,
+            area: r.area,
+            city: null,
+            price_range: r.price_range,
+            image_url: r.image_url,
+            has_online_reservation: true,
+          };
+        }),
+        timeSlots: {},
+      }) + '\n');
+    }
+
+    console.log(`[tableall-search] total restaurants: ${result.restaurants.length}`);
+    if (!clientGone) {
+      res.write(JSON.stringify({ type: 'done', totalRestaurants: result.restaurants.length }) + '\n');
+    }
+    res.end();
+  } catch (error) {
+    console.error('[tableall-search] failed', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'TableAll search failed', details: String(error) });
+    } else if (!clientGone) {
+      res.write(JSON.stringify({ type: 'error', error: String(error) }) + '\n');
+      res.end();
+    }
+  }
+});
