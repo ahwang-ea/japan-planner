@@ -1155,6 +1155,10 @@ export interface TabelogReview {
   mealType: string | null;
   priceRange: string | null;
   photos: string[];
+  reviewUrl?: string | null;
+  photoCount?: number;
+  title_en?: string | null;
+  body_en?: string | null;
 }
 
 export interface TabelogReviews {
@@ -1189,11 +1193,166 @@ function saveReviewCache() {
 }
 loadReviewCache();
 
+// ── Translation cache ────────────────────────────────────────────────────────
+
+const TRANSLATION_CACHE_FILE = path.join(
+  process.env.DATABASE_PATH ? path.dirname(process.env.DATABASE_PATH) : './data',
+  'tabelog-translations-cache.json',
+);
+const TRANSLATION_CACHE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+type TranslationCacheEntry = { title_en: string | null; body_en: string | null; timestamp: number };
+let translationCache = new Map<string, TranslationCacheEntry>();
+
+function loadTranslationCache() {
+  try {
+    if (fs.existsSync(TRANSLATION_CACHE_FILE)) {
+      translationCache = new Map(Object.entries(JSON.parse(fs.readFileSync(TRANSLATION_CACHE_FILE, 'utf-8'))));
+    }
+  } catch { /* ignore */ }
+}
+function saveTranslationCache() {
+  try {
+    const dir = path.dirname(TRANSLATION_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(TRANSLATION_CACHE_FILE, JSON.stringify(Object.fromEntries(translationCache)));
+  } catch { /* non-critical */ }
+}
+loadTranslationCache();
+
+function translationKey(title: string | null, body: string): string {
+  const content = `${title || ''}|||${body.slice(0, 200)}`;
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    hash = ((hash << 5) - hash) + content.charCodeAt(i);
+    hash |= 0;
+  }
+  return String(hash);
+}
+
+async function translateBatch(
+  client: Anthropic,
+  reviews: TabelogReview[],
+): Promise<{ title_en: string | null; body_en: string }[]> {
+  const reviewsPayload = reviews.map((r, i) => ({
+    id: i + 1,
+    title: r.title || '',
+    body: r.body.slice(0, 2000),
+  }));
+
+  const resp = await client.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 4096,
+    messages: [{
+      role: 'user',
+      content: `Translate these Japanese restaurant reviews to natural English. Preserve the tone and meaning. Return a JSON array with objects containing "id", "title_en", and "body_en" for each review. If a title is empty, set title_en to null.
+
+Reviews:
+${JSON.stringify(reviewsPayload, null, 2)}
+
+Respond with ONLY valid JSON array, no other text.`,
+    }],
+  });
+
+  let text = resp.content[0]?.type === 'text' ? resp.content[0].text.trim() : '[]';
+  // Strip markdown code fences if present
+  if (text.startsWith('```')) {
+    text = text.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+  }
+  let parsed: { id: number; title_en: string | null; body_en: string }[];
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    console.log(`  [translate] failed to parse LLM response as JSON: ${text.slice(0, 200)}`);
+    return reviews.map(() => ({ title_en: null, body_en: '' }));
+  }
+
+  return reviews.map((_, i) => {
+    const match = parsed.find(p => p.id === i + 1);
+    return match
+      ? { title_en: match.title_en, body_en: match.body_en }
+      : { title_en: null, body_en: '' };
+  });
+}
+
+/**
+ * Translate review titles and bodies from Japanese to English using Claude Haiku.
+ * Batches multiple reviews per LLM call for efficiency.
+ * Results are cached for 30 days independently of the review scrape cache.
+ * Optional onBatch callback streams translated batches as they complete.
+ */
+export async function translateReviews(
+  reviews: TabelogReview[],
+  onBatch?: (translated: TabelogReview[]) => void,
+): Promise<TabelogReview[]> {
+  const client = getAnthropic();
+  if (!client) return reviews;
+
+  const result: TabelogReview[] = [...reviews];
+  const needsTranslation: { index: number; review: TabelogReview }[] = [];
+
+  // Apply cached translations
+  const cachedBatch: TabelogReview[] = [];
+  for (let i = 0; i < reviews.length; i++) {
+    const review = reviews[i]!;
+    const key = translationKey(review.title, review.body);
+    const cached = translationCache.get(key);
+    if (cached && Date.now() - cached.timestamp < TRANSLATION_CACHE_TTL) {
+      result[i] = { ...review, title_en: cached.title_en, body_en: cached.body_en };
+      cachedBatch.push(result[i]!);
+    } else {
+      needsTranslation.push({ index: i, review });
+    }
+  }
+
+  // Stream cached translations immediately
+  if (cachedBatch.length > 0 && onBatch) {
+    onBatch(cachedBatch);
+  }
+
+  if (needsTranslation.length === 0) {
+    console.log(`  [translate] all ${reviews.length} reviews cached`);
+    return result;
+  }
+
+  console.log(`  [translate] ${reviews.length - needsTranslation.length} cached, translating ${needsTranslation.length}...`);
+
+  const BATCH_SIZE = 5;
+  for (let batchStart = 0; batchStart < needsTranslation.length; batchStart += BATCH_SIZE) {
+    const batch = needsTranslation.slice(batchStart, batchStart + BATCH_SIZE);
+    try {
+      const translations = await translateBatch(client, batch.map(b => b.review));
+      const batchResult: TabelogReview[] = [];
+      for (let j = 0; j < batch.length; j++) {
+        const { index, review } = batch[j]!;
+        const translation = translations[j];
+        if (translation && (translation.title_en || translation.body_en)) {
+          result[index] = { ...review, title_en: translation.title_en, body_en: translation.body_en };
+          const key = translationKey(review.title, review.body);
+          translationCache.set(key, { ...translation, timestamp: Date.now() });
+          batchResult.push(result[index]!);
+        }
+      }
+      if (batchResult.length > 0 && onBatch) {
+        onBatch(batchResult);
+      }
+    } catch (err) {
+      console.log(`  [translate] batch failed: ${err}`);
+    }
+  }
+
+  saveTranslationCache();
+  return result;
+}
+
 /**
  * Scrape all reviews from a Tabelog restaurant's review page.
  * Paginates through all pages to collect the complete review set.
  */
-export async function scrapeTabelogReviews(tabelogUrl: string): Promise<TabelogReviews> {
+export async function scrapeTabelogReviews(
+  tabelogUrl: string,
+  onPage?: (pageReviews: TabelogReview[], page: number, totalCount: number, averageScore: number | null) => void,
+): Promise<TabelogReviews> {
   const cached = reviewCache.get(tabelogUrl);
   if (cached && Date.now() - cached.timestamp < REVIEW_CACHE_TTL) {
     console.log(`  [reviews] CACHE HIT ${tabelogUrl} (${cached.reviews.length} reviews)`);
@@ -1289,7 +1448,7 @@ export async function scrapeTabelogReviews(tabelogUrl: string): Promise<TabelogR
       if (/ランチ|lunch/i.test(visitText)) mealType = 'lunch';
       else if (/ディナー|dinner/i.test(visitText)) mealType = 'dinner';
 
-      // Reviewer photos
+      // Reviewer photos (list page shows max 3)
       const photos: string[] = [];
       item.find('.rvw-photo a.js-imagebox-trigger').each((_j, photoEl) => {
         const href = $(photoEl).attr('href');
@@ -1298,13 +1457,22 @@ export async function scrapeTabelogReviews(tabelogUrl: string): Promise<TabelogR
         }
       });
 
+      // Individual review URL + total photo count
+      const reviewHref = item.find('.rvw-item__title a, a.rvw-item__title-target').first().attr('href') || null;
+      const reviewUrl = reviewHref ? new URL(reviewHref, 'https://tabelog.com').href : null;
+      const moreNum = parseInt(item.find('.c-photo-more__num').text().trim(), 10);
+      const photoCount = photos.length + (isNaN(moreNum) ? 0 : moreNum);
+
       if (body) {
-        allReviews.push({ author, rating, date, title, body, visitDate, mealType, priceRange, photos });
+        allReviews.push({ author, rating, date, title, body, visitDate, mealType, priceRange, photos, reviewUrl, photoCount });
         pageReviews++;
       }
     });
 
     console.log(`  [reviews] page ${page}: ${pageReviews} reviews (total so far: ${allReviews.length})`);
+    if (pageReviews > 0 && onPage) {
+      onPage(allReviews.slice(-pageReviews), page, totalCount, averageScore);
+    }
 
     // Check for next page
     const hasNext = $('a.c-pagination__arrow--next').length > 0;
@@ -1318,4 +1486,60 @@ export async function scrapeTabelogReviews(tabelogUrl: string): Promise<TabelogR
   saveReviewCache();
   console.log(`  [reviews] ${tabelogUrl}: ${allReviews.length} reviews scraped (total available: ${totalCount})`);
   return result;
+}
+
+/**
+ * Scrape all photos from an individual Tabelog review page.
+ * The page may contain multiple visits by the same reviewer —
+ * bodyHint matches the correct visit's comment to return only its photos.
+ */
+export async function scrapeReviewPhotos(reviewUrl: string, bodyHint?: string): Promise<string[]> {
+  console.log(`  [review-photos] FETCH ${reviewUrl}`);
+  try {
+    const res = await fetch(reviewUrl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return [];
+    const html = await res.text();
+    const $ = cheerio.load(html);
+
+    // Match the specific visit by body text, then take its adjacent photo section
+    if (bodyHint) {
+      const hint = bodyHint.slice(0, 40);
+      let matched = false;
+      const comments = $('.rvw-item__rvw-comment');
+      for (let i = 0; i < comments.length; i++) {
+        const commentText = $(comments[i]!).text().trim();
+        if (commentText.includes(hint)) {
+          // The photo section immediately follows the comment in the DOM
+          const photoSection = $(comments[i]!).next('.rvw-photo');
+          if (photoSection.length) {
+            const photos: string[] = [];
+            photoSection.find('a.js-imagebox-trigger').each((_j, el) => {
+              const href = $(el).attr('href');
+              if (href && href.includes('tblg.k-img.com')) {
+                photos.push(upgradeThumbnail(href));
+              }
+            });
+            console.log(`  [review-photos] matched visit ${i + 1}: ${photos.length} photos`);
+            matched = true;
+            return photos;
+          }
+        }
+      }
+      if (!matched) console.log(`  [review-photos] no body match found, returning all`);
+    }
+
+    // Fallback: return all photos on the page
+    const photos: string[] = [];
+    $('.rvw-photo a.js-imagebox-trigger').each((_i, el) => {
+      const href = $(el).attr('href');
+      if (href && href.includes('tblg.k-img.com')) {
+        photos.push(upgradeThumbnail(href));
+      }
+    });
+    console.log(`  [review-photos] ${photos.length} photos found (all)`);
+    return photos;
+  } catch (err) {
+    console.log(`  [review-photos] failed: ${err}`);
+    return [];
+  }
 }

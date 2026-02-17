@@ -82,19 +82,51 @@ restaurantsRouter.get('/photos', async (req, res) => {
   }
 });
 
-// Get reviews for a Tabelog restaurant (must be before /:id)
+// Get all photos for a single review (lazy-loaded when modal opens)
+restaurantsRouter.get('/reviews/photos', async (req, res) => {
+  const url = req.query.url as string;
+  if (!url || !url.includes('tabelog.com')) {
+    res.status(400).json({ error: 'Valid Tabelog review URL is required' });
+    return;
+  }
+  try {
+    const { scrapeReviewPhotos } = await import('../lib/scrapers/tabelog.js');
+    const bodyHint = req.query.body as string | undefined;
+    const photos = await scrapeReviewPhotos(url, bodyHint);
+    res.json({ photos });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to scrape review photos', details: String(error) });
+  }
+});
+
+// Get reviews for a Tabelog restaurant — streams NDJSON (must be before /:id)
 restaurantsRouter.get('/reviews', async (req, res) => {
   const url = req.query.url as string;
   if (!url || !url.includes('tabelog.com')) {
     res.status(400).json({ error: 'Valid Tabelog URL is required' });
     return;
   }
+  res.setHeader('Content-Type', 'application/x-ndjson');
   try {
-    const { scrapeTabelogReviews } = await import('../lib/scrapers/tabelog.js');
-    const reviews = await scrapeTabelogReviews(url);
-    res.json(reviews);
+    const { scrapeTabelogReviews, translateReviews } = await import('../lib/scrapers/tabelog.js');
+    let streamed = false;
+    const data = await scrapeTabelogReviews(url, (pageReviews, page, totalCount, averageScore) => {
+      streamed = true;
+      res.write(JSON.stringify({ type: 'page', reviews: pageReviews, page, totalCount, averageScore }) + '\n');
+    });
+    // For cache hits (onPage not called), send all reviews at once
+    if (!streamed) {
+      res.write(JSON.stringify({ type: 'page', reviews: data.reviews, page: 0, totalCount: data.totalCount, averageScore: data.averageScore }) + '\n');
+    }
+    // Stream translations as batches complete
+    await translateReviews(data.reviews, (translated) => {
+      res.write(JSON.stringify({ type: 'translations', reviews: translated }) + '\n');
+    });
+    res.write(JSON.stringify({ type: 'done' }) + '\n');
+    res.end();
   } catch (error) {
-    res.status(500).json({ error: 'Failed to scrape reviews', details: String(error) });
+    res.write(JSON.stringify({ type: 'error', error: String(error) }) + '\n');
+    res.end();
   }
 });
 
