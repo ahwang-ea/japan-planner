@@ -64,12 +64,15 @@ export function useCommandPalette(commands: Command[]) {
     (e: React.KeyboardEvent) => {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
+        e.stopPropagation();
         setSelectedIndex(i => (i + 1) % (filteredCommands.length || 1));
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
+        e.stopPropagation();
         setSelectedIndex(i => (i - 1 + (filteredCommands.length || 1)) % (filteredCommands.length || 1));
       } else if (e.key === 'Enter') {
         e.preventDefault();
+        e.stopPropagation();
         const cmd = filteredCommands[selectedIndex];
         if (cmd) {
           cmd.onSelect();
@@ -77,6 +80,7 @@ export function useCommandPalette(commands: Command[]) {
         }
       } else if (e.key === 'Escape') {
         e.preventDefault();
+        e.stopPropagation();
         close();
       }
     },
