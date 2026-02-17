@@ -65,6 +65,39 @@ restaurantsRouter.post('/scrape', async (req, res) => {
   }
 });
 
+// Get photos for a Tabelog restaurant (must be before /:id)
+restaurantsRouter.get('/photos', async (req, res) => {
+  const url = req.query.url as string;
+  if (!url || !url.includes('tabelog.com')) {
+    res.status(400).json({ error: 'Valid Tabelog URL is required' });
+    return;
+  }
+  try {
+    const category = (req.query.category as string) || 'all';
+    const { scrapeTabelogPhotos } = await import('../lib/scrapers/tabelog.js');
+    const photos = await scrapeTabelogPhotos(url, category);
+    res.json(photos);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to scrape photos', details: String(error) });
+  }
+});
+
+// Get reviews for a Tabelog restaurant (must be before /:id)
+restaurantsRouter.get('/reviews', async (req, res) => {
+  const url = req.query.url as string;
+  if (!url || !url.includes('tabelog.com')) {
+    res.status(400).json({ error: 'Valid Tabelog URL is required' });
+    return;
+  }
+  try {
+    const { scrapeTabelogReviews } = await import('../lib/scrapers/tabelog.js');
+    const reviews = await scrapeTabelogReviews(url);
+    res.json(reviews);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to scrape reviews', details: String(error) });
+  }
+});
+
 // Get single restaurant
 restaurantsRouter.get('/:id', (req, res) => {
   const restaurant = db.prepare('SELECT * FROM restaurants WHERE id = ?').get(req.params.id);
