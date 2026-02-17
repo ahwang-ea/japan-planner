@@ -21,6 +21,10 @@ interface TabelogReview {
   mealType: string | null;
   priceRange: string | null;
   photos?: string[];
+  reviewUrl?: string | null;
+  photoCount?: number;
+  title_en?: string | null;
+  body_en?: string | null;
 }
 
 interface Props {
@@ -79,6 +83,41 @@ export default function RestaurantDetailPanel({
   const [reviews, setReviews] = useState<TabelogReview[]>([]);
   const [reviewsLoading, setReviewsLoading] = useState(false);
   const [reviewCount, setReviewCount] = useState(0);
+  const [showOriginal, setShowOriginal] = useState(false);
+  const [expandedReview, setExpandedReview] = useState<TabelogReview | null>(null);
+  const [modalPhotos, setModalPhotos] = useState<string[] | null>(null);
+  const [modalPhotosLoading, setModalPhotosLoading] = useState(false);
+
+  // Lazy-load full photos when review modal opens
+  useEffect(() => {
+    setModalPhotos(null);
+    if (!expandedReview?.reviewUrl || !expandedReview.photoCount || expandedReview.photoCount <= (expandedReview.photos?.length || 0)) return;
+    setModalPhotosLoading(true);
+    const params = new URLSearchParams({ url: expandedReview.reviewUrl, body: expandedReview.body.slice(0, 40) });
+    api<{ photos: string[] }>(`/restaurants/reviews/photos?${params}`)
+      .then(data => setModalPhotos(data.photos))
+      .catch(() => {})
+      .finally(() => setModalPhotosLoading(false));
+  }, [expandedReview]);
+
+  // ESC closes modals before propagating to parent (which closes the panel)
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (showGallery) {
+        e.stopPropagation();
+        e.preventDefault();
+        setShowGallery(false);
+        setGalleryPhotos(null);
+      } else if (expandedReview) {
+        e.stopPropagation();
+        e.preventDefault();
+        setExpandedReview(null);
+      }
+    };
+    window.addEventListener('keydown', handler, true); // capture phase
+    return () => window.removeEventListener('keydown', handler, true);
+  }, [showGallery, expandedReview]);
 
   // Auto-fetch availability when panel opens or restaurant changes
   useEffect(() => {
@@ -126,19 +165,54 @@ export default function RestaurantDetailPanel({
       .finally(() => setPhotosLoading(false));
   }, [r.tabelog_url, photoCategory]);
 
-  // Auto-fetch reviews when restaurant changes
+  // Auto-fetch reviews when restaurant changes (streaming NDJSON)
   useEffect(() => {
     setReviews([]);
     setReviewCount(0);
-    if (!r.tabelog_url) return;
+    setShowOriginal(false);
+    const tabelogUrl = r.tabelog_url;
+    if (!tabelogUrl) return;
     setReviewsLoading(true);
-    api<{ reviews: TabelogReview[]; totalCount: number }>(`/restaurants/reviews?url=${encodeURIComponent(r.tabelog_url)}`)
-      .then(data => {
-        setReviews(data.reviews);
-        setReviewCount(data.totalCount);
-      })
-      .catch(() => {})
-      .finally(() => setReviewsLoading(false));
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch(`/api/restaurants/reviews?url=${encodeURIComponent(tabelogUrl)}`, { signal: controller.signal });
+        if (!res.ok || !res.body) throw new Error('Failed to fetch reviews');
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            const msg = JSON.parse(line);
+            if (msg.type === 'page') {
+              setReviews(prev => [...prev, ...msg.reviews]);
+              if (msg.totalCount) setReviewCount(msg.totalCount);
+            } else if (msg.type === 'translations') {
+              // Merge translations into existing reviews by matching body text
+              const translationMap = new Map<string, TabelogReview>();
+              for (const t of msg.reviews as TabelogReview[]) {
+                translationMap.set(t.body, t);
+              }
+              setReviews(prev => prev.map(rev => {
+                const translated = translationMap.get(rev.body);
+                return translated ? { ...rev, title_en: translated.title_en, body_en: translated.body_en } : rev;
+              }));
+            }
+          }
+        }
+      } catch (e) {
+        if ((e as Error).name !== 'AbortError') console.error(e);
+      } finally {
+        setReviewsLoading(false);
+      }
+    })();
+    return () => controller.abort();
   }, [r.tabelog_url]);
 
   const scoreColor = (score: number | null) =>
@@ -426,47 +500,60 @@ export default function RestaurantDetailPanel({
                   {reviewsLoading && (
                     <span className="inline-block w-3 h-3 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
                   )}
+                  {reviews.length > 0 && reviews.some(r => r.body_en) && (
+                    <button
+                      onClick={() => setShowOriginal(o => !o)}
+                      className="ml-auto text-xs px-2 py-0.5 rounded border border-gray-200 text-gray-500 hover:bg-gray-100"
+                    >
+                      {showOriginal ? 'Show English' : 'Show Japanese'}
+                    </button>
+                  )}
                 </h3>
                 {reviews.length > 0 && (
                   <div className="mt-3 space-y-4 max-h-96 overflow-y-auto">
-                    {reviews.map((review, i) => (
-                      <div key={i} className="border-l-2 border-gray-200 pl-3">
-                        <div className="flex items-center gap-2 text-xs text-gray-500 flex-wrap">
-                          {review.author && <span className="font-medium">{review.author}</span>}
-                          {review.rating != null && (
-                            <span className={`font-bold ${scoreColor(review.rating)}`}>
-                              {review.rating.toFixed(1)}
-                            </span>
-                          )}
-                          {review.visitDate && <span>{review.visitDate}</span>}
-                          {review.mealType && (
-                            <span className="px-1.5 py-0.5 bg-gray-100 rounded text-xs">{review.mealType}</span>
-                          )}
-                          {review.priceRange && <span>{review.priceRange}</span>}
-                        </div>
-                        {review.title && (
-                          <p className="text-sm font-medium text-gray-800 mt-1">{review.title}</p>
-                        )}
-                        <p className="text-sm text-gray-600 mt-1 whitespace-pre-wrap">{review.body}</p>
-                        {review.photos && review.photos.length > 0 && (
-                          <div className="flex gap-1.5 mt-2 overflow-x-auto">
-                            {review.photos.map((photo, j) => (
-                              <img
-                                key={j}
-                                src={photo}
-                                alt=""
-                                className="w-20 h-20 object-cover rounded cursor-pointer flex-shrink-0 hover:opacity-80"
-                                onClick={() => {
-                                  setGalleryPhotos(review.photos!);
-                                  setPhotoIndex(j);
-                                  setShowGallery(true);
-                                }}
-                              />
-                            ))}
+                    {reviews.map((review, i) => {
+                      const bodyText = !showOriginal && review.body_en ? review.body_en : review.body;
+                      const truncated = bodyText.length > 150;
+                      return (
+                        <div
+                          key={i}
+                          className="border-l-2 border-gray-200 pl-3 cursor-pointer hover:bg-gray-50 -ml-px rounded-r"
+                          onClick={() => setExpandedReview(review)}
+                        >
+                          <div className="flex items-center gap-2 text-xs text-gray-500 flex-wrap">
+                            {review.author && <span className="font-medium">{review.author}</span>}
+                            {review.rating != null && (
+                              <span className={`font-bold ${scoreColor(review.rating)}`}>
+                                {review.rating.toFixed(1)}
+                              </span>
+                            )}
+                            {review.visitDate && <span>{review.visitDate}</span>}
+                            {review.mealType && (
+                              <span className="px-1.5 py-0.5 bg-gray-100 rounded text-xs">{review.mealType}</span>
+                            )}
+                            {review.priceRange && <span>{review.priceRange}</span>}
                           </div>
-                        )}
-                      </div>
-                    ))}
+                          {(review.title || review.title_en) && (
+                            <p className="text-sm font-medium text-gray-800 mt-1">
+                              {!showOriginal && review.title_en ? review.title_en : review.title}
+                            </p>
+                          )}
+                          <p className="text-sm text-gray-600 mt-1">
+                            {truncated ? bodyText.slice(0, 150) + '...' : bodyText}
+                          </p>
+                          {review.photos && review.photos.length > 0 && (
+                            <div className="flex gap-1 mt-1.5">
+                              {review.photos.slice(0, 3).map((photo, j) => (
+                                <img key={j} src={photo} alt="" className="w-10 h-10 object-cover rounded flex-shrink-0" />
+                              ))}
+                              {(review.photoCount || review.photos.length) > 3 && (
+                                <span className="text-xs text-gray-400 self-center ml-1">+more</span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
                 {!reviewsLoading && reviews.length === 0 && (
@@ -493,6 +580,73 @@ export default function RestaurantDetailPanel({
         <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">t</kbd> add to trip</span>
         <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">Esc</kbd> back to list</span>
       </div>
+
+      {/* Review detail modal */}
+      {expandedReview && (
+        <div
+          className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4"
+          onClick={() => setExpandedReview(null)}
+        >
+          <div
+            className="bg-white rounded-lg shadow-xl max-w-lg w-full max-h-[85vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="sticky top-0 bg-white border-b px-4 py-3 flex items-center justify-between">
+              <div className="flex items-center gap-2 text-sm">
+                {expandedReview.author && <span className="font-medium text-gray-700">{expandedReview.author}</span>}
+                {expandedReview.rating != null && (
+                  <span className={`font-bold ${scoreColor(expandedReview.rating)}`}>
+                    {expandedReview.rating.toFixed(1)}
+                  </span>
+                )}
+              </div>
+              <button onClick={() => setExpandedReview(null)} className="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+            </div>
+            <div className="px-4 py-3 space-y-3">
+              <div className="flex items-center gap-2 text-xs text-gray-500 flex-wrap">
+                {expandedReview.visitDate && <span>{expandedReview.visitDate}</span>}
+                {expandedReview.mealType && (
+                  <span className="px-1.5 py-0.5 bg-gray-100 rounded">{expandedReview.mealType}</span>
+                )}
+                {expandedReview.priceRange && <span>{expandedReview.priceRange}</span>}
+              </div>
+              {(expandedReview.title || expandedReview.title_en) && (
+                <p className="font-medium text-gray-900">
+                  {!showOriginal && expandedReview.title_en ? expandedReview.title_en : expandedReview.title}
+                </p>
+              )}
+              <p className="text-sm text-gray-700 whitespace-pre-wrap leading-relaxed">
+                {!showOriginal && expandedReview.body_en ? expandedReview.body_en : expandedReview.body}
+              </p>
+              {(() => {
+                const photos = modalPhotos || expandedReview.photos || [];
+                return photos.length > 0 ? (
+                  <div>
+                    {modalPhotosLoading && (
+                      <p className="text-xs text-gray-400 mb-1.5">Loading all photos...</p>
+                    )}
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {photos.map((photo, j) => (
+                        <img
+                          key={j}
+                          src={photo}
+                          alt=""
+                          className="w-full aspect-square object-cover rounded cursor-pointer hover:opacity-80"
+                          onClick={() => {
+                            setGalleryPhotos(photos);
+                            setPhotoIndex(j);
+                            setShowGallery(true);
+                          }}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ) : null;
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Full-screen photo gallery overlay */}
       {showGallery && activeGalleryPhotos.length > 0 && (
