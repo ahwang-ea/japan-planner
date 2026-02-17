@@ -11,6 +11,18 @@ interface ReservationAvailability {
   error?: string;
 }
 
+interface TabelogReview {
+  author: string | null;
+  rating: number | null;
+  date: string | null;
+  title: string | null;
+  body: string;
+  visitDate: string | null;
+  mealType: string | null;
+  priceRange: string | null;
+  photos?: string[];
+}
+
 interface Props {
   restaurant: Restaurant | TabelogResult;
   onClose: () => void;
@@ -55,6 +67,19 @@ export default function RestaurantDetailPanel({
   const [loadingAvail, setLoadingAvail] = useState(false);
   const fetchedUrlRef = useRef<string | null>(null);
 
+  // Photo state
+  const [photos, setPhotos] = useState<string[]>([]);
+  const [photosLoading, setPhotosLoading] = useState(false);
+  const [photoIndex, setPhotoIndex] = useState(0);
+  const [showGallery, setShowGallery] = useState(false);
+  const [photoCategory, setPhotoCategory] = useState('all');
+  const [galleryPhotos, setGalleryPhotos] = useState<string[] | null>(null);
+
+  // Review state
+  const [reviews, setReviews] = useState<TabelogReview[]>([]);
+  const [reviewsLoading, setReviewsLoading] = useState(false);
+  const [reviewCount, setReviewCount] = useState(0);
+
   // Auto-fetch availability when panel opens or restaurant changes
   useEffect(() => {
     if (externalAvailability) {
@@ -82,18 +107,52 @@ export default function RestaurantDetailPanel({
     }
   }, [r.tabelog_url]);
 
+  // Reset photo category when restaurant changes
+  useEffect(() => {
+    setPhotoCategory('all');
+  }, [r.tabelog_url]);
+
+  // Auto-fetch photos when restaurant or category changes
+  useEffect(() => {
+    setPhotos([]);
+    setPhotoIndex(0);
+    setShowGallery(false);
+    if (!r.tabelog_url) return;
+    setPhotosLoading(true);
+    const catParam = photoCategory !== 'all' ? `&category=${photoCategory}` : '';
+    api<{ photos: string[]; totalCount: number }>(`/restaurants/photos?url=${encodeURIComponent(r.tabelog_url)}${catParam}`)
+      .then(data => setPhotos(data.photos))
+      .catch(() => {})
+      .finally(() => setPhotosLoading(false));
+  }, [r.tabelog_url, photoCategory]);
+
+  // Auto-fetch reviews when restaurant changes
+  useEffect(() => {
+    setReviews([]);
+    setReviewCount(0);
+    if (!r.tabelog_url) return;
+    setReviewsLoading(true);
+    api<{ reviews: TabelogReview[]; totalCount: number }>(`/restaurants/reviews?url=${encodeURIComponent(r.tabelog_url)}`)
+      .then(data => {
+        setReviews(data.reviews);
+        setReviewCount(data.totalCount);
+      })
+      .catch(() => {})
+      .finally(() => setReviewsLoading(false));
+  }, [r.tabelog_url]);
+
   const scoreColor = (score: number | null) =>
     !score ? 'text-gray-400' :
     score >= 4.0 ? 'text-red-600' :
     score >= 3.5 ? 'text-orange-500' :
     'text-gray-600';
 
-  const platformLinks = saved ? [
-    { label: 'Tabelog', url: saved.tabelog_url },
-    { label: 'Omakase', url: saved.omakase_url },
-    { label: 'TableCheck', url: saved.tablecheck_url },
-    { label: 'TableAll', url: saved.tableall_url },
-  ].filter(p => p.url) : r.tabelog_url ? [{ label: 'Tabelog', url: r.tabelog_url }] : [];
+  const platformLinks = [
+    { label: 'Tabelog', url: r.tabelog_url },
+    { label: 'Omakase', url: saved?.omakase_url || ('omakase_url' in r ? r.omakase_url : null) },
+    { label: 'TableCheck', url: saved?.tablecheck_url || ('tablecheck_url' in r ? r.tablecheck_url : null) },
+    { label: 'TableAll', url: saved?.tableall_url || ('tableall_url' in r ? r.tableall_url : null) },
+  ].filter(p => p.url);
 
   const formatCheckedAt = (iso: string) => {
     const diff = Date.now() - new Date(iso).getTime();
@@ -118,6 +177,10 @@ export default function RestaurantDetailPanel({
       default: return { symbol: '?', color: 'text-gray-400 bg-gray-50 border-gray-200' };
     }
   };
+
+  const displayPhotos = photos.length > 0 ? photos : r.image_url ? [r.image_url] : [];
+  // Gallery overlay can show either main photos or review-specific photos
+  const activeGalleryPhotos = galleryPhotos || displayPhotos;
 
   return (
     <div className="flex flex-col h-full">
@@ -158,14 +221,72 @@ export default function RestaurantDetailPanel({
       {/* Body */}
       <div className="flex-1 overflow-y-auto py-6">
         <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          {r.image_url && (
-            <img
-              src={r.image_url}
-              alt={r.name || ''}
-              className="w-full h-56 object-cover"
-              onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
-            />
+          {/* Photo carousel */}
+          {(displayPhotos.length > 0 || photosLoading) && (
+            <div className="relative">
+              {displayPhotos.length > 0 ? (
+                <img
+                  src={displayPhotos[photoIndex]}
+                  alt={r.name || ''}
+                  className={`w-full h-56 object-cover ${displayPhotos.length > 1 ? 'cursor-pointer' : ''}`}
+                  onClick={() => { if (displayPhotos.length > 1) { setGalleryPhotos(null); setShowGallery(true); } }}
+                  onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                />
+              ) : (
+                <div className="w-full h-56 bg-gray-100 flex items-center justify-center">
+                  <span className="inline-block w-5 h-5 border-2 border-gray-400 border-t-transparent rounded-full animate-spin" />
+                </div>
+              )}
+              {displayPhotos.length > 1 && (
+                <div className="absolute bottom-2 right-2 flex items-center gap-1">
+                  <button
+                    onClick={e => { e.stopPropagation(); setPhotoIndex(i => Math.max(0, i - 1)); }}
+                    disabled={photoIndex === 0}
+                    className="px-1.5 py-0.5 bg-black/50 text-white rounded text-xs hover:bg-black/70 disabled:opacity-30"
+                  >&larr;</button>
+                  <span className="px-2 py-0.5 bg-black/50 text-white rounded text-xs">
+                    {photoIndex + 1} / {displayPhotos.length}
+                  </span>
+                  <button
+                    onClick={e => { e.stopPropagation(); setPhotoIndex(i => Math.min(displayPhotos.length - 1, i + 1)); }}
+                    disabled={photoIndex === displayPhotos.length - 1}
+                    className="px-1.5 py-0.5 bg-black/50 text-white rounded text-xs hover:bg-black/70 disabled:opacity-30"
+                  >&rarr;</button>
+                </div>
+              )}
+              {photosLoading && displayPhotos.length > 0 && (
+                <div className="absolute top-2 right-2 px-2 py-1 bg-black/50 text-white rounded text-xs flex items-center gap-1.5">
+                  <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Loading photos...
+                </div>
+              )}
+              {/* Photo category tabs */}
+              {r.tabelog_url && (
+                <div className="absolute top-2 left-2 flex gap-1">
+                  {[
+                    { key: 'all', label: 'All' },
+                    { key: 'food', label: 'Food' },
+                    { key: 'drinks', label: 'Drinks' },
+                    { key: 'interior', label: 'Interior' },
+                    { key: 'exterior', label: 'Exterior' },
+                  ].map(cat => (
+                    <button
+                      key={cat.key}
+                      onClick={e => { e.stopPropagation(); setPhotoCategory(cat.key); }}
+                      className={`px-2 py-0.5 rounded text-xs font-medium transition-colors ${
+                        photoCategory === cat.key
+                          ? 'bg-white text-gray-900 shadow'
+                          : 'bg-black/40 text-white/80 hover:bg-black/60 hover:text-white'
+                      }`}
+                    >
+                      {cat.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
+
           <div className="p-6">
             {/* Header */}
             <div className="flex items-start justify-between">
@@ -212,7 +333,7 @@ export default function RestaurantDetailPanel({
             {platformLinks.length > 0 && (
               <div className="mt-6">
                 <h3 className="text-sm font-medium text-gray-700 mb-2">Links</h3>
-                <div className="flex gap-2">
+                <div className="flex gap-2 flex-wrap">
                   {platformLinks.map(p => (
                     <a
                       key={p.label}
@@ -297,6 +418,63 @@ export default function RestaurantDetailPanel({
               </div>
             )}
 
+            {/* Reviews */}
+            {r.tabelog_url && (
+              <div className="mt-6">
+                <h3 className="flex items-center gap-2 text-sm font-medium text-gray-700">
+                  <span>Reviews{reviewCount > 0 ? ` (${reviewCount})` : ''}</span>
+                  {reviewsLoading && (
+                    <span className="inline-block w-3 h-3 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+                  )}
+                </h3>
+                {reviews.length > 0 && (
+                  <div className="mt-3 space-y-4 max-h-96 overflow-y-auto">
+                    {reviews.map((review, i) => (
+                      <div key={i} className="border-l-2 border-gray-200 pl-3">
+                        <div className="flex items-center gap-2 text-xs text-gray-500 flex-wrap">
+                          {review.author && <span className="font-medium">{review.author}</span>}
+                          {review.rating != null && (
+                            <span className={`font-bold ${scoreColor(review.rating)}`}>
+                              {review.rating.toFixed(1)}
+                            </span>
+                          )}
+                          {review.visitDate && <span>{review.visitDate}</span>}
+                          {review.mealType && (
+                            <span className="px-1.5 py-0.5 bg-gray-100 rounded text-xs">{review.mealType}</span>
+                          )}
+                          {review.priceRange && <span>{review.priceRange}</span>}
+                        </div>
+                        {review.title && (
+                          <p className="text-sm font-medium text-gray-800 mt-1">{review.title}</p>
+                        )}
+                        <p className="text-sm text-gray-600 mt-1 whitespace-pre-wrap">{review.body}</p>
+                        {review.photos && review.photos.length > 0 && (
+                          <div className="flex gap-1.5 mt-2 overflow-x-auto">
+                            {review.photos.map((photo, j) => (
+                              <img
+                                key={j}
+                                src={photo}
+                                alt=""
+                                className="w-20 h-20 object-cover rounded cursor-pointer flex-shrink-0 hover:opacity-80"
+                                onClick={() => {
+                                  setGalleryPhotos(review.photos!);
+                                  setPhotoIndex(j);
+                                  setShowGallery(true);
+                                }}
+                              />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!reviewsLoading && reviews.length === 0 && (
+                  <p className="text-xs text-gray-400 mt-2">No reviews found</p>
+                )}
+              </div>
+            )}
+
             {/* Notes (saved only) */}
             {saved?.notes && (
               <div className="mt-6">
@@ -315,6 +493,50 @@ export default function RestaurantDetailPanel({
         <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">t</kbd> add to trip</span>
         <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">Esc</kbd> back to list</span>
       </div>
+
+      {/* Full-screen photo gallery overlay */}
+      {showGallery && activeGalleryPhotos.length > 0 && (
+        <div
+          className="fixed inset-0 bg-black/90 z-50 flex flex-col items-center justify-center"
+          onClick={() => { setShowGallery(false); setGalleryPhotos(null); }}
+        >
+          <button
+            onClick={() => { setShowGallery(false); setGalleryPhotos(null); }}
+            className="absolute top-4 right-4 text-white/80 hover:text-white text-3xl leading-none z-10"
+          >&times;</button>
+          <div className="relative flex-1 flex items-center justify-center w-full px-16" onClick={e => e.stopPropagation()}>
+            {photoIndex > 0 && (
+              <button
+                onClick={() => setPhotoIndex(i => i - 1)}
+                className="absolute left-4 text-white/70 hover:text-white text-4xl"
+              >&lsaquo;</button>
+            )}
+            <img
+              src={activeGalleryPhotos[photoIndex]}
+              className="max-w-full max-h-[80vh] object-contain"
+              alt=""
+            />
+            {photoIndex < activeGalleryPhotos.length - 1 && (
+              <button
+                onClick={() => setPhotoIndex(i => i + 1)}
+                className="absolute right-4 text-white/70 hover:text-white text-4xl"
+              >&rsaquo;</button>
+            )}
+          </div>
+          <div className="flex gap-1.5 py-4 overflow-x-auto max-w-full px-4" onClick={e => e.stopPropagation()}>
+            {activeGalleryPhotos.map((p, i) => (
+              <img
+                key={i}
+                src={p}
+                onClick={() => setPhotoIndex(i)}
+                className={`w-16 h-12 object-cover rounded cursor-pointer flex-shrink-0 ${i === photoIndex ? 'ring-2 ring-white' : 'opacity-50 hover:opacity-80'}`}
+                alt=""
+              />
+            ))}
+          </div>
+          <div className="text-white/60 text-sm pb-4">{photoIndex + 1} / {activeGalleryPhotos.length}</div>
+        </div>
+      )}
     </div>
   );
 }

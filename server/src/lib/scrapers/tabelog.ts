@@ -948,3 +948,374 @@ export async function discoverPlatformLinks(
   console.log(`  [platform-discover] ${name}${area ? ` (${area})` : ''}: TC=${result.tablecheck_url ? 'yes' : 'no'} OM=${result.omakase_url ? 'yes' : 'no'} TA=${result.tableall_url ? 'yes' : 'no'}`);
   return result;
 }
+
+// ── Photo scraping ───────────────────────────────────────────────────────────
+
+export interface PhotoCategory {
+  id: string;       // e.g. 'all', 'food', 'interior', 'exterior', 'drinks', 'other'
+  label: string;    // e.g. 'All', 'Food', 'Interior'
+  count: number;
+}
+
+export interface TabelogPhotos {
+  photos: string[];
+  totalCount: number;
+  categories: PhotoCategory[];
+  category: string;  // which category was scraped
+  scrapedAt: string;
+}
+
+const PHOTO_CACHE_FILE = path.join(
+  process.env.DATABASE_PATH ? path.dirname(process.env.DATABASE_PATH) : './data',
+  'tabelog-photos-cache.json',
+);
+const PHOTO_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+type PhotoCacheEntry = TabelogPhotos & { timestamp: number };
+let photoCache = new Map<string, PhotoCacheEntry>();
+
+function loadPhotoCache() {
+  try {
+    if (fs.existsSync(PHOTO_CACHE_FILE)) {
+      photoCache = new Map(Object.entries(JSON.parse(fs.readFileSync(PHOTO_CACHE_FILE, 'utf-8'))));
+    }
+  } catch { /* ignore */ }
+}
+function savePhotoCache() {
+  try {
+    const dir = path.dirname(PHOTO_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(PHOTO_CACHE_FILE, JSON.stringify(Object.fromEntries(photoCache)));
+  } catch { /* non-critical */ }
+}
+loadPhotoCache();
+
+/**
+ * Convert an English Tabelog URL to the Japanese equivalent.
+ * Photo and review pages only exist on the Japanese site.
+ */
+function toJapaneseUrl(url: string): string {
+  return url.replace('tabelog.com/en/', 'tabelog.com/');
+}
+
+/**
+ * Upgrade a Tabelog thumbnail URL to a larger version.
+ * "320x320_rect_81227.jpg" → "640x640_rect_81227.jpg"
+ * Already-large or full-size URLs are returned unchanged.
+ */
+function upgradeThumbnail(url: string): string {
+  return url.replace(/\/\d+x\d+(?:_rect|_square)?_/, '/640x640_rect_');
+}
+
+// Tabelog photo category URL path segments
+// dtlphotolst/smp2/ = all, 1/smp2/ = food, 3/smp2/ = interior, 4/smp2/ = exterior, 5/smp2/ = other, 7/smp2/ = drinks
+const PHOTO_CATEGORY_MAP: Record<string, { pathSegment: string; label: string; jpLabel: string }> = {
+  all:      { pathSegment: '',  label: 'All',      jpLabel: 'すべて' },
+  food:     { pathSegment: '1', label: 'Food',     jpLabel: '料理' },
+  drinks:   { pathSegment: '7', label: 'Drinks',   jpLabel: 'ドリンク' },
+  interior: { pathSegment: '3', label: 'Interior', jpLabel: '内観' },
+  exterior: { pathSegment: '4', label: 'Exterior', jpLabel: '外観' },
+  other:    { pathSegment: '5', label: 'Other',    jpLabel: 'その他' },
+};
+
+/**
+ * Parse photo category counts from the nav sublist on a photo page.
+ */
+function parsePhotoCategories($: cheerio.CheerioAPI): PhotoCategory[] {
+  const categories: PhotoCategory[] = [];
+  const navLinks = $('a[href*="dtlphotolst"]');
+  for (const [id, meta] of Object.entries(PHOTO_CATEGORY_MAP)) {
+    navLinks.each((_i, el) => {
+      const text = $(el).text().trim();
+      if (text.includes(meta.jpLabel)) {
+        const countMatch = text.match(/(\d+)/);
+        const count = countMatch ? parseInt(countMatch[1]!, 10) : 0;
+        if (!categories.find(c => c.id === id)) {
+          categories.push({ id, label: meta.label, count });
+        }
+      }
+    });
+  }
+  return categories;
+}
+
+/**
+ * Extract photo URLs from a cheerio-parsed photo page.
+ */
+function extractPhotosFromPage($: cheerio.CheerioAPI, seen: Set<string>): string[] {
+  const photos: string[] = [];
+  // Primary: link targets in imagebox triggers (these point to larger images)
+  $('a.js-imagebox-trigger').each((_i, el) => {
+    const href = $(el).attr('href');
+    if (href && href.includes('tblg.k-img.com') && !seen.has(href)) {
+      seen.add(href);
+      photos.push(upgradeThumbnail(href));
+    }
+  });
+  // Fallback: image elements in the photo list
+  if (photos.length === 0) {
+    $('.rstdtl-photo-list__img img, .rstdtl-photo-list img').each((_i, el) => {
+      for (const attr of ['data-original', 'data-lazy', 'data-src', 'src']) {
+        const val = $(el).attr(attr);
+        if (val && val.includes('tblg.k-img.com') && !val.includes('no_image') && !seen.has(val)) {
+          seen.add(val);
+          photos.push(upgradeThumbnail(val));
+          break;
+        }
+      }
+    });
+  }
+  return photos;
+}
+
+/**
+ * Scrape photos from a Tabelog restaurant's photo gallery.
+ * Supports category filtering (food, interior, exterior, drinks, other).
+ * Uses the small grid view (smp2, 40 items/page) for efficient scraping.
+ * Paginates through all pages to collect the full set.
+ */
+export async function scrapeTabelogPhotos(tabelogUrl: string, category: string = 'all'): Promise<TabelogPhotos> {
+  const cacheKey = `${tabelogUrl}:${category}`;
+  const cached = photoCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < PHOTO_CACHE_TTL) {
+    console.log(`  [photos] CACHE HIT ${tabelogUrl} cat=${category} (${cached.photos.length} photos)`);
+    return { photos: cached.photos, totalCount: cached.totalCount, categories: cached.categories, category: cached.category, scrapedAt: cached.scrapedAt };
+  }
+
+  const baseUrl = toJapaneseUrl(tabelogUrl.replace(/\/$/, ''));
+  const catMeta = PHOTO_CATEGORY_MAP[category] || PHOTO_CATEGORY_MAP.all!;
+  const catPath = catMeta.pathSegment ? `${catMeta.pathSegment}/` : '';
+
+  const allPhotos: string[] = [];
+  const seen = new Set<string>();
+  let totalCount = 0;
+  let categories: PhotoCategory[] = [];
+  let page = 1;
+  const MAX_PAGES = 15;
+
+  while (page <= MAX_PAGES) {
+    // Use smp2 (small grid, 40 per page) for efficient scraping
+    const pageUrl = page === 1
+      ? `${baseUrl}/dtlphotolst/${catPath}smp2/`
+      : `${baseUrl}/dtlphotolst/${catPath}smp2/?smp=0&sby=D&srt=normal&PG=${page}`;
+
+    console.log(`  [photos] FETCH ${pageUrl}`);
+    let html: string;
+    try {
+      const res = await fetch(pageUrl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) });
+      if (!res.ok) break;
+      html = await res.text();
+    } catch {
+      break;
+    }
+
+    const $ = cheerio.load(html);
+
+    // Extract total count and categories on first page
+    if (page === 1) {
+      // Total from page count display
+      const countEl = $('span.c-page-count__num').last().text().trim();
+      if (countEl) totalCount = parseInt(countEl, 10) || 0;
+      // Fallback from title
+      if (totalCount === 0) {
+        const titleMatch = $('title').text().match(/写真.*?(\d+)/);
+        if (titleMatch) totalCount = parseInt(titleMatch[1]!, 10);
+      }
+      categories = parsePhotoCategories($);
+    }
+
+    const pagePhotos = extractPhotosFromPage($, seen);
+    allPhotos.push(...pagePhotos);
+
+    console.log(`  [photos] page ${page}: ${pagePhotos.length} photos (total so far: ${allPhotos.length})`);
+
+    // Check for next page
+    const hasNext = $('a.c-pagination__arrow--next').length > 0;
+    if (!hasNext || pagePhotos.length === 0) break;
+    page++;
+  }
+
+  if (totalCount === 0) totalCount = allPhotos.length;
+  const result: TabelogPhotos = { photos: allPhotos, totalCount, categories, category, scrapedAt: new Date().toISOString() };
+  photoCache.set(cacheKey, { ...result, timestamp: Date.now() });
+  savePhotoCache();
+  console.log(`  [photos] ${tabelogUrl} cat=${category}: ${allPhotos.length} photos scraped (total available: ${totalCount})`);
+  return result;
+}
+
+// ── Review scraping ──────────────────────────────────────────────────────────
+
+export interface TabelogReview {
+  author: string | null;
+  rating: number | null;
+  date: string | null;
+  title: string | null;
+  body: string;
+  visitDate: string | null;
+  mealType: string | null;
+  priceRange: string | null;
+  photos: string[];
+}
+
+export interface TabelogReviews {
+  reviews: TabelogReview[];
+  totalCount: number;
+  averageScore: number | null;
+  scrapedAt: string;
+}
+
+const REVIEW_CACHE_FILE = path.join(
+  process.env.DATABASE_PATH ? path.dirname(process.env.DATABASE_PATH) : './data',
+  'tabelog-reviews-cache.json',
+);
+const REVIEW_CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+type ReviewCacheEntry = TabelogReviews & { timestamp: number };
+let reviewCache = new Map<string, ReviewCacheEntry>();
+
+function loadReviewCache() {
+  try {
+    if (fs.existsSync(REVIEW_CACHE_FILE)) {
+      reviewCache = new Map(Object.entries(JSON.parse(fs.readFileSync(REVIEW_CACHE_FILE, 'utf-8'))));
+    }
+  } catch { /* ignore */ }
+}
+function saveReviewCache() {
+  try {
+    const dir = path.dirname(REVIEW_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(REVIEW_CACHE_FILE, JSON.stringify(Object.fromEntries(reviewCache)));
+  } catch { /* non-critical */ }
+}
+loadReviewCache();
+
+/**
+ * Scrape all reviews from a Tabelog restaurant's review page.
+ * Paginates through all pages to collect the complete review set.
+ */
+export async function scrapeTabelogReviews(tabelogUrl: string): Promise<TabelogReviews> {
+  const cached = reviewCache.get(tabelogUrl);
+  if (cached && Date.now() - cached.timestamp < REVIEW_CACHE_TTL) {
+    console.log(`  [reviews] CACHE HIT ${tabelogUrl} (${cached.reviews.length} reviews)`);
+    return { reviews: cached.reviews, totalCount: cached.totalCount, averageScore: cached.averageScore, scrapedAt: cached.scrapedAt };
+  }
+
+  const baseUrl = toJapaneseUrl(tabelogUrl.replace(/\/$/, ''));
+  const allReviews: TabelogReview[] = [];
+  let totalCount = 0;
+  let averageScore: number | null = null;
+  let page = 1;
+  const MAX_PAGES = 20;
+
+  while (page <= MAX_PAGES) {
+    const pageUrl = page === 1
+      ? `${baseUrl}/dtlrvwlst/`
+      : `${baseUrl}/dtlrvwlst/COND-0/smp1/?lc=0&rvw_part=all&PG=${page}`;
+
+    console.log(`  [reviews] FETCH ${pageUrl}`);
+    let html: string;
+    try {
+      const res = await fetch(pageUrl, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) });
+      if (!res.ok) break;
+      html = await res.text();
+    } catch {
+      break;
+    }
+
+    const $ = cheerio.load(html);
+
+    // Extract total count and average score on first page
+    if (page === 1) {
+      const titleText = $('title').text();
+      const countMatch = titleText.match(/口コミ.*?(\d+)/);
+      if (countMatch) totalCount = parseInt(countMatch[1]!, 10);
+      // Also try from meta description
+      if (totalCount === 0) {
+        const descText = $('meta[name="description"]').attr('content') || '';
+        const descMatch = descText.match(/口コミ(\d+)件/);
+        if (descMatch) totalCount = parseInt(descMatch[1]!, 10);
+      }
+      // Average score from header
+      const scoreText = $('.rdheader-rating__score-val-dtl').first().text().trim();
+      if (scoreText) {
+        const parsed = parseFloat(scoreText);
+        if (!isNaN(parsed) && parsed > 0 && parsed <= 5) averageScore = parsed;
+      }
+    }
+
+    // Parse review items
+    let pageReviews = 0;
+    $('.rvw-item.js-rvw-item-clickable-area').each((_i, el) => {
+      const item = $(el);
+
+      // Author
+      const author = item.find('.rvw-item__rvwr-name a').first().text().trim() || null;
+
+      // Rating — from the total rating value
+      let rating: number | null = null;
+      const ratingText = item.find('.rvw-item__ratings-total .c-rating-v3__val').first().text().trim();
+      if (ratingText) {
+        const parsed = parseFloat(ratingText);
+        if (!isNaN(parsed) && parsed > 0 && parsed <= 5) rating = parsed;
+      }
+      // Fallback: extract from class like c-rating-v3--val35
+      if (!rating) {
+        const ratingClass = item.find('.rvw-item__ratings-total').attr('class') || '';
+        const valMatch = ratingClass.match(/c-rating-v3--val(\d+)/);
+        if (valMatch) rating = parseInt(valMatch[1]!, 10) / 10;
+      }
+
+      // Date
+      const date = item.find('.rvw-item__date').first().text().trim() || null;
+
+      // Title
+      const title = item.find('.rvw-item__title-target').first().text().trim() || null;
+
+      // Body — full text from comment div
+      const commentEl = item.find('.rvw-item__rvw-comment');
+      // Remove hidden "show more" elements and get text
+      commentEl.find('.rvw-item__more').remove();
+      const body = commentEl.text().trim();
+
+      // Price range
+      const priceRange = item.find('.rvw-item__payment-amount').first().text().trim() || null;
+
+      // Visit info / meal type
+      let visitDate: string | null = null;
+      let mealType: string | null = null;
+      const visitText = item.find('.rvw-item__rvw-info').text();
+      const visitMatch = visitText.match(/(\d{4}\/\d{2})/);
+      if (visitMatch) visitDate = visitMatch[1]!;
+      if (/ランチ|lunch/i.test(visitText)) mealType = 'lunch';
+      else if (/ディナー|dinner/i.test(visitText)) mealType = 'dinner';
+
+      // Reviewer photos
+      const photos: string[] = [];
+      item.find('.rvw-photo a.js-imagebox-trigger').each((_j, photoEl) => {
+        const href = $(photoEl).attr('href');
+        if (href && href.includes('tblg.k-img.com')) {
+          photos.push(upgradeThumbnail(href));
+        }
+      });
+
+      if (body) {
+        allReviews.push({ author, rating, date, title, body, visitDate, mealType, priceRange, photos });
+        pageReviews++;
+      }
+    });
+
+    console.log(`  [reviews] page ${page}: ${pageReviews} reviews (total so far: ${allReviews.length})`);
+
+    // Check for next page
+    const hasNext = $('a.c-pagination__arrow--next').length > 0;
+    if (!hasNext || pageReviews === 0) break;
+    page++;
+  }
+
+  if (totalCount === 0) totalCount = allReviews.length;
+  const result: TabelogReviews = { reviews: allReviews, totalCount, averageScore, scrapedAt: new Date().toISOString() };
+  reviewCache.set(tabelogUrl, { ...result, timestamp: Date.now() });
+  saveReviewCache();
+  console.log(`  [reviews] ${tabelogUrl}: ${allReviews.length} reviews scraped (total available: ${totalCount})`);
+  return result;
+}
