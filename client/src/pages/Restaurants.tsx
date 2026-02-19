@@ -54,7 +54,7 @@ interface ReservationAvailability {
   tabelogUrl: string;
   hasOnlineReservation: boolean;
   reservationUrl: string | null;
-  dates: { date: string; status: 'available' | 'limited' | 'unavailable' | 'unknown'; timeSlots: string[] }[];
+  dates: { date: string; status: 'available' | 'limited' | 'unavailable' | 'unknown'; timeSlots: string[]; meals?: { lunch: 'available' | 'unavailable'; dinner: 'available' | 'unavailable' } }[];
   checkedAt: string;
   error?: string;
 }
@@ -120,6 +120,7 @@ export default function Restaurants() {
   const [showTabelog, setShowTabelog] = useState(true);
   const [showTableAll, setShowTableAll] = useState(true);
   const [showTableCheck, setShowTableCheck] = useState(true);
+  const [showOmakase, setShowOmakase] = useState(true);
   const [filterDateFrom, setFilterDateFrom] = useState('');
   const [filterDateTo, setFilterDateTo] = useState('');
   const [filterMeals, setFilterMeals] = useState<Set<'lunch' | 'dinner'>>(new Set());
@@ -188,7 +189,7 @@ export default function Restaurants() {
   }, [showBookableOnly, showSpotsOpenOnly, filterDateFrom, filterMeals, filterPartySize]);
 
   const effectiveDateFilterKey = effectiveDateFilter
-    ? `${city}:${effectiveDateFilter.svd}:${filterDateTo || ''}:${effectiveDateFilter.svt || ''}:${effectiveDateFilter.svps || ''}:tl=${showTabelog}:ta=${showTableAll}:tc=${showTableCheck}`
+    ? `${city}:${effectiveDateFilter.svd}:${filterDateTo || ''}:${effectiveDateFilter.svt || ''}:${effectiveDateFilter.svps || ''}:tl=${showTabelog}:ta=${showTableAll}:tc=${showTableCheck}:om=${showOmakase}`
     : '';
   const dateFilterBrowsedRef = useRef(effectiveDateFilterKey);
 
@@ -363,7 +364,7 @@ export default function Restaurants() {
       .finally(() => setBrowseLoading(false));
   };
 
-  const isFiltering = selectedCuisines.size > 0 || showBookableOnly || showSpotsOpenOnly || !showTabelog || !showTableAll || !showTableCheck;
+  const isFiltering = selectedCuisines.size > 0 || showBookableOnly || showSpotsOpenOnly || !showTabelog || !showTableAll || !showTableCheck || !showOmakase;
 
   // Collect unique cuisines: start with common set, merge in discovered ones from results
   const availableCuisines = [...new Set([
@@ -426,9 +427,10 @@ export default function Restaurants() {
   const filteredResults = isFiltering
     ? allResults.filter(r => {
         // Source filter
-        if (!showTabelog && r.tabelog_url && !r.tableall_url && !r.tablecheck_url) return false;
-        if (!showTableAll && r.tableall_url && !r.tablecheck_url) return false;
-        if (!showTableCheck && r.tablecheck_url && !r.tableall_url && !r.tabelog_url) return false;
+        if (!showTabelog && r.tabelog_url && !r.tableall_url && !r.tablecheck_url && !r.omakase_url) return false;
+        if (!showTableAll && r.tableall_url && !r.tablecheck_url && !r.omakase_url) return false;
+        if (!showTableCheck && r.tablecheck_url && !r.tableall_url && !r.tabelog_url && !r.omakase_url) return false;
+        if (!showOmakase && r.omakase_url && !r.tabelog_url && !r.tableall_url && !r.tablecheck_url) return false;
         if (selectedCuisines.size > 0 && !matchesCuisine(r)) return false;
         if (showBookableOnly) {
           // Use inline data from browse (instant — no separate check needed)
@@ -565,29 +567,32 @@ export default function Restaurants() {
             const msg = JSON.parse(line);
 
             if (msg.type === 'date') {
-              const { date, available, restaurants: dateRestaurants, timeSlots: dateTimeSlots } = msg as {
+              const { date, available, restaurants: dateRestaurants, timeSlots: dateTimeSlots, mealAvailability: dateMealAvail } = msg as {
                 date: string;
                 available: string[];
                 restaurants: TabelogResult[];
                 timeSlots: Record<string, string[]>;
+                mealAvailability?: Record<string, { lunch: 'available' | 'unavailable'; dinner: 'available' | 'unavailable' }>;
               };
 
               console.log(`[${label}] streamed ${date}: ${available.length} available, ${dateRestaurants.length} new restaurants`);
 
               if (dateRestaurants.length > 0) {
                 setAllResults(prev => {
-                  // Build set of ALL known URLs (tabelog, tableall, tablecheck) for robust dedup
+                  // Build set of ALL known URLs (tabelog, tableall, tablecheck, omakase) for robust dedup
                   const existingUrls = new Set<string>();
                   for (const x of prev) {
                     if (x.tabelog_url) existingUrls.add(normalizeUrl(x.tabelog_url));
                     if (x.tableall_url) existingUrls.add(x.tableall_url);
                     if (x.tablecheck_url) existingUrls.add(x.tablecheck_url);
+                    if (x.omakase_url) existingUrls.add(x.omakase_url);
                   }
                   const newOnes = dateRestaurants.filter((r: TabelogResult) => {
                     if (r.tabelog_url && existingUrls.has(normalizeUrl(r.tabelog_url))) return false;
                     if (r.tableall_url && existingUrls.has(r.tableall_url)) return false;
                     if (r.tablecheck_url && existingUrls.has(r.tablecheck_url)) return false;
-                    return !!(r.tabelog_url || r.tableall_url || r.tablecheck_url);
+                    if (r.omakase_url && existingUrls.has(r.omakase_url)) return false;
+                    return !!(r.tabelog_url || r.tableall_url || r.tablecheck_url || r.omakase_url);
                   });
                   return newOnes.length > 0 ? [...prev, ...newOnes] : prev;
                 });
@@ -599,6 +604,7 @@ export default function Restaurants() {
 
                 const labelDomain = label === 'tableall' ? 'tableall.com'
                   : label === 'tablecheck' ? 'tablecheck.com'
+                  : label === 'omakase' ? 'omakase.in'
                   : 'tabelog.com';
                 const allKnownUrls = new Set([
                   ...available,
@@ -609,7 +615,8 @@ export default function Restaurants() {
                   const isAvailable = availableSet.has(key);
                   const slots = dateTimeSlots[url] || dateTimeSlots[key] || [];
                   const existing = next.get(key);
-                  const newDateEntry = { date, status: (isAvailable ? 'available' : 'unavailable') as 'available' | 'unavailable', timeSlots: slots };
+                  const mealData = dateMealAvail?.[url] || dateMealAvail?.[key];
+                  const newDateEntry = { date, status: (isAvailable ? 'available' : 'unavailable') as 'available' | 'unavailable', timeSlots: slots, meals: mealData || undefined };
 
                   if (existing) {
                     const otherDates = existing.dates.filter(d => d.date !== date);
@@ -632,7 +639,7 @@ export default function Restaurants() {
               });
             } else if (msg.type === 'platform-update') {
               // Enrich existing results with discovered platform links
-              const updates = msg.restaurants as { tabelog_url?: string; name?: string; tablecheck_url?: string | null; omakase_url?: string | null; tableall_url?: string | null }[];
+              const updates = msg.restaurants as { tabelog_url?: string; tabelog_score?: number | null; name?: string; tablecheck_url?: string | null; omakase_url?: string | null; tableall_url?: string | null }[];
               console.log(`[${label}] platform-update: ${updates.length} restaurants enriched`);
               const mergePlatformLinks = (prev: TabelogResult[]) => {
                 let changed = false;
@@ -646,6 +653,8 @@ export default function Restaurants() {
                     if (match.tablecheck_url && !r.tablecheck_url) { merged.tablecheck_url = match.tablecheck_url; changed = true; }
                     if (match.omakase_url && !r.omakase_url) { merged.omakase_url = match.omakase_url; changed = true; }
                     if (match.tableall_url && !r.tableall_url) { merged.tableall_url = match.tableall_url; changed = true; }
+                    if (match.tabelog_url && !r.tabelog_url) { merged.tabelog_url = match.tabelog_url; changed = true; }
+                    if (match.tabelog_score && !r.tabelog_score) { merged.tabelog_score = match.tabelog_score; changed = true; }
                     return merged;
                   }
                   return r;
@@ -654,6 +663,8 @@ export default function Restaurants() {
               };
               setAllResults(mergePlatformLinks);
               setBrowseResults(mergePlatformLinks);
+            } else if (msg.type === 'progress') {
+              console.log(`[${label}] ${msg.message}`);
             } else if (msg.type === 'done') {
               console.log(`[${label}] stream done: ${msg.totalRestaurants} total restaurants`);
             }
@@ -701,6 +712,18 @@ export default function Restaurants() {
         );
       }
 
+      if (showOmakase) {
+        searches.push(
+          fetch('/api/availability/search-omakase', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dates: datesToSearch, city, guestsCount: filterPartySize }),
+            signal: abortController.signal,
+          }).then(r => processNDJSONStream(r, 'omakase'))
+            .catch(err => { if (err.name !== 'AbortError') console.error('[batch-avail] omakase search failed:', err); })
+        );
+      }
+
       Promise.all(searches).finally(() => {
         batchSearchRunningRef.current = false;
         setAvailChecking(false);
@@ -712,7 +735,7 @@ export default function Restaurants() {
           }
           let changed = false;
           const updated = prev.map(r => {
-            if (!r.tabelog_score && (r.tableall_url || r.tablecheck_url) && r.name && scoreByName.has(r.name)) {
+            if (!r.tabelog_score && (r.tableall_url || r.tablecheck_url || r.omakase_url) && r.name && scoreByName.has(r.name)) {
               changed = true;
               return { ...r, tabelog_score: scoreByName.get(r.name)! };
             }
@@ -1733,7 +1756,7 @@ export default function Restaurants() {
                 <div className="mb-4 flex items-center gap-2 flex-wrap">
                   <span className="text-xs font-medium text-gray-500 uppercase mr-1">Source:</span>
                   <button
-                    onClick={() => { if (!showTabelog || showTableAll || showTableCheck) setShowTabelog(v => !v); }}
+                    onClick={() => { if (!showTabelog || showTableAll || showTableCheck || showOmakase) setShowTabelog(v => !v); }}
                     className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
                       showTabelog
                         ? 'bg-amber-500 text-white'
@@ -1743,7 +1766,7 @@ export default function Restaurants() {
                     Tabelog
                   </button>
                   <button
-                    onClick={() => { if (!showTableAll || showTabelog || showTableCheck) setShowTableAll(v => !v); }}
+                    onClick={() => { if (!showTableAll || showTabelog || showTableCheck || showOmakase) setShowTableAll(v => !v); }}
                     className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
                       showTableAll
                         ? 'bg-purple-600 text-white'
@@ -1753,7 +1776,7 @@ export default function Restaurants() {
                     TableAll
                   </button>
                   <button
-                    onClick={() => { if (!showTableCheck || showTabelog || showTableAll) setShowTableCheck(v => !v); }}
+                    onClick={() => { if (!showTableCheck || showTabelog || showTableAll || showOmakase) setShowTableCheck(v => !v); }}
                     className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
                       showTableCheck
                         ? 'bg-teal-600 text-white'
@@ -1761,6 +1784,16 @@ export default function Restaurants() {
                     }`}
                   >
                     TableCheck
+                  </button>
+                  <button
+                    onClick={() => { if (!showOmakase || showTabelog || showTableAll || showTableCheck) setShowOmakase(v => !v); }}
+                    className={`px-3 py-1.5 text-xs rounded-full flex items-center gap-1.5 ${
+                      showOmakase
+                        ? 'bg-rose-600 text-white'
+                        : 'bg-white border border-gray-200 text-gray-600 hover:bg-gray-50'
+                    }`}
+                  >
+                    Omakase
                   </button>
                   <span className="mx-1 text-gray-300">|</span>
                   <span className="text-xs font-medium text-gray-500 uppercase mr-1">Booking:</span>
@@ -2011,6 +2044,24 @@ export default function Restaurants() {
                                 const dateData = avail?.dates.find(ad => ad.date === d);
                                 const confirmedBookable = avail?.hasOnlineReservation === true;
                                 if (dateData && dateData.status !== 'unknown') {
+                                  if (dateData.meals) {
+                                    const lAvail = dateData.meals.lunch === 'available';
+                                    const dAvail = dateData.meals.dinner === 'available';
+                                    return (
+                                      <td key={d} className="px-0.5 py-2 text-center">
+                                        <div className="flex flex-col items-center gap-1">
+                                          <div className={`text-xs font-medium flex items-center gap-0.5 ${lAvail ? 'text-green-600' : 'text-red-400'}`} title={`Lunch: ${dateData.meals.lunch}`}>
+                                            <span className="text-[10px]">L</span>
+                                            <span>{lAvail ? '◯' : '✕'}</span>
+                                          </div>
+                                          <div className={`text-xs font-medium flex items-center gap-0.5 ${dAvail ? 'text-green-600' : 'text-red-400'}`} title={`Dinner: ${dateData.meals.dinner}`}>
+                                            <span className="text-[10px]">D</span>
+                                            <span>{dAvail ? '◯' : '✕'}</span>
+                                          </div>
+                                        </div>
+                                      </td>
+                                    );
+                                  }
                                   const { symbol, color } = statusSymbol(dateData.status);
                                   return <td key={d} className={`px-1 py-3 text-center text-xs font-medium ${color}`}>{symbol}</td>;
                                 }
@@ -2040,12 +2091,18 @@ export default function Restaurants() {
                                     const d = new Date(nearest.date + 'T00:00:00');
                                     const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                                     const symbol = nearest.status === 'limited' ? '△' : '◯';
+                                    const mealHint = nearest.meals
+                                      ? nearest.meals.lunch === 'available' && nearest.meals.dinner === 'available' ? ' L+D'
+                                        : nearest.meals.lunch === 'available' ? ' L'
+                                        : nearest.meals.dinner === 'available' ? ' D'
+                                        : ''
+                                      : '';
                                     return (
                                       <span
                                         className={`text-xs font-medium ${nearest.status === 'limited' ? 'text-yellow-600' : 'text-green-600'}`}
-                                        title={`Next: ${label}${nearest.timeSlots.length ? ' (' + nearest.timeSlots.join(', ') + ')' : ''}`}
+                                        title={`Next: ${label}${mealHint ? ` (${mealHint.trim()})` : ''}${nearest.timeSlots.length ? ' (' + nearest.timeSlots.join(', ') + ')' : ''}`}
                                       >
-                                        {symbol} {label}
+                                        {symbol} {label}{mealHint}
                                       </span>
                                     );
                                   }

@@ -3,6 +3,16 @@ import db from '../lib/db.js';
 
 export const availabilityRouter = Router();
 
+// Classify time slots into lunch vs dinner availability
+function classifyMeals(timeSlots: string[]): { lunch: 'available' | 'unavailable'; dinner: 'available' | 'unavailable' } {
+  let hasLunch = false, hasDinner = false;
+  for (const t of timeSlots) {
+    const hour = parseInt(t.split(':')[0], 10);
+    if (!isNaN(hour)) { if (hour < 15) hasLunch = true; else hasDinner = true; }
+  }
+  return { lunch: hasLunch ? 'available' : 'unavailable', dinner: hasDinner ? 'available' : 'unavailable' };
+}
+
 // Get availability results for a restaurant + trip
 availabilityRouter.get('/', (req, res) => {
   const { restaurant_id, trip_id } = req.query;
@@ -146,6 +156,12 @@ availabilityRouter.post('/search', async (req, res) => {
 
       console.log(`[avail-search]   ${date}: ${available.length} available`);
 
+      // Build meal availability from time slots
+      const dateMealAvail: Record<string, { lunch: 'available' | 'unavailable'; dinner: 'available' | 'unavailable' }> = {};
+      for (const [url, slots] of Object.entries(dateTimeSlots)) {
+        if (slots.length > 0) dateMealAvail[url] = classifyMeals(slots);
+      }
+
       // Stream this date's results immediately, enriched with cached platform links
       if (!clientGone) {
         res.write(JSON.stringify({
@@ -157,6 +173,7 @@ availabilityRouter.post('/search', async (req, res) => {
             return cached ? { ...r, ...cached } : r;
           }),
           timeSlots: dateTimeSlots,
+          mealAvailability: dateMealAvail,
         }) + '\n');
       }
     }));
@@ -415,6 +432,12 @@ availabilityRouter.post('/search-tablecheck', async (req, res) => {
         }
       }
 
+      // Build meal availability from time slots
+      const dateMealAvail: Record<string, { lunch: 'available' | 'unavailable'; dinner: 'available' | 'unavailable' }> = {};
+      for (const [url, slots] of Object.entries(dateTimeSlots)) {
+        if (slots.length > 0) dateMealAvail[url] = classifyMeals(slots);
+      }
+
       console.log(`[tablecheck-search]   ${date}: ${available.length} available`);
 
       res.write(JSON.stringify({
@@ -441,6 +464,7 @@ availabilityRouter.post('/search-tablecheck', async (req, res) => {
           };
         }),
         timeSlots: dateTimeSlots,
+        mealAvailability: dateMealAvail,
       }) + '\n');
     }
 
@@ -593,6 +617,173 @@ availabilityRouter.post('/discover-platforms', async (req, res) => {
   } catch (error) {
     console.error('[discover-platforms] FAIL', error);
     if (!clientGone) {
+      res.write(JSON.stringify({ type: 'error', error: String(error) }) + '\n');
+      res.end();
+    }
+  }
+});
+
+// Omakase.in Premium date-range availability search
+// Streams results per-date as NDJSON (same format as /search) for the client to consume
+availabilityRouter.post('/search-omakase', async (req, res) => {
+  const { dates, city, guestsCount } = req.body;
+  if (!dates?.length) {
+    res.status(400).json({ error: 'dates[] is required' });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  let clientGone = false;
+  res.on('close', () => { clientGone = true; });
+
+  try {
+    const { browseOmakase, AREA_IDS } = await import('../lib/scrapers/omakase.js');
+    const { lookupScoresByName, getCachedPlatformLinks, discoverPlatformLinks } = await import('../lib/scrapers/tabelog.js');
+    const sortedDates = (dates as string[]).slice(0, 14).sort();
+    const dateFrom = sortedDates[0]!;
+    const dateTo = sortedDates[sortedDates.length - 1]!;
+    const cityKey = (city || 'tokyo').toLowerCase();
+    const areaId = AREA_IDS[cityKey] || 171;
+
+    console.log(`[omakase-search] dates=${sortedDates.join(',')} city=${cityKey} area_id=${areaId} guests=${guestsCount || 2}`);
+
+    // Stream a progress event immediately so the client knows something is happening
+    res.write(JSON.stringify({ type: 'progress', message: 'Connecting to omakase.in...' }) + '\n');
+
+    // Track all restaurants and scores for final enrichment
+    const scoreByName = new Map<string, { tabelog_url: string | null; tabelog_score: number | null }>();
+    const emittedUrls = new Set<string>();
+    const allRestaurantsForDiscovery: { name: string; omakase_url: string; area: string | null }[] = [];
+
+    // Stream results page-by-page as the scraper yields them
+    const result = await browseOmakase(dateFrom, dateTo, areaId, guestsCount || 2, false, (pageRestaurants, pageNum, hasMore) => {
+      if (clientGone || pageRestaurants.length === 0) return;
+
+      // Enrich with Tabelog ratings from DB
+      const names = pageRestaurants.map(r => r.name);
+      const placeholders = names.map(() => '?').join(',');
+      const dbMatches = names.length > 0
+        ? db.prepare(`SELECT name, tabelog_url, tabelog_score FROM restaurants WHERE name IN (${placeholders})`).all(...names) as { name: string; tabelog_url: string | null; tabelog_score: number | null }[]
+        : [];
+      for (const m of dbMatches) scoreByName.set(m.name, { tabelog_url: m.tabelog_url, tabelog_score: m.tabelog_score });
+
+      // Stream per-date availability for this page's restaurants
+      for (const date of sortedDates) {
+        if (clientGone) return;
+
+        const available: string[] = [];
+        const dateRestaurants: typeof pageRestaurants = [];
+
+        for (const r of pageRestaurants) {
+          if (r.available_dates.includes(date)) {
+            available.push(r.omakase_url);
+            if (!emittedUrls.has(r.omakase_url)) {
+              emittedUrls.add(r.omakase_url);
+              dateRestaurants.push(r);
+              allRestaurantsForDiscovery.push({ name: r.name, omakase_url: r.omakase_url, area: r.area });
+            }
+          }
+        }
+
+        if (available.length === 0 && dateRestaurants.length === 0) continue;
+
+        // Build meal availability from omakase's available_meals data
+        const dateMealAvail: Record<string, { lunch: 'available' | 'unavailable'; dinner: 'available' | 'unavailable' }> = {};
+        for (const r of pageRestaurants) {
+          if (r.available_dates.includes(date)) {
+            const meals = r.available_meals[date];
+            dateMealAvail[r.omakase_url] = {
+              lunch: meals?.includes('lunch') ? 'available' : 'unavailable',
+              dinner: meals?.includes('dinner') ? 'available' : 'unavailable',
+            };
+          }
+        }
+
+        console.log(`[omakase-search] p${pageNum} ${date}: ${available.length} available`);
+
+        res.write(JSON.stringify({
+          type: 'date',
+          date,
+          available,
+          restaurants: dateRestaurants.map(r => {
+            const match = scoreByName.get(r.name);
+            const cached = getCachedPlatformLinks(r.name, cityKey, r.area);
+            return {
+              name: r.name,
+              name_ja: null,
+              tabelog_url: match?.tabelog_url || null,
+              tableall_url: cached?.tableall_url || null,
+              tablecheck_url: cached?.tablecheck_url || null,
+              omakase_url: r.omakase_url,
+              tabelog_score: match?.tabelog_score || null,
+              cuisine: r.cuisine,
+              area: r.area,
+              city: null,
+              price_range: null,
+              image_url: r.image_url,
+              has_online_reservation: true,
+            };
+          }),
+          timeSlots: {},
+          mealAvailability: dateMealAvail,
+        }) + '\n');
+      }
+
+      if (!clientGone) {
+        res.write(JSON.stringify({ type: 'progress', message: `Page ${pageNum} scraped (${pageRestaurants.length} restaurants)${hasMore ? ', loading more...' : ''}` }) + '\n');
+      }
+    });
+
+    console.log(`[omakase-search] total restaurants: ${result.restaurants.length}`);
+
+    // Enrich uncovered names with Tabelog cache/search
+    const uncoveredNames = result.restaurants.map(r => r.name).filter(n => !scoreByName.has(n));
+    if (uncoveredNames.length > 0) {
+      const cacheMatches = await lookupScoresByName(uncoveredNames, cityKey);
+      for (const [name, data] of cacheMatches) scoreByName.set(name, data);
+      // Stream score updates to client
+      const scoreUpdates = [...cacheMatches.entries()]
+        .filter(([, d]) => d.tabelog_score)
+        .map(([name, d]) => ({ name, tabelog_url: d.tabelog_url, tabelog_score: d.tabelog_score }));
+      if (scoreUpdates.length > 0 && !clientGone) {
+        res.write(JSON.stringify({ type: 'platform-update', restaurants: scoreUpdates }) + '\n');
+      }
+    }
+
+    if (!clientGone) {
+      res.write(JSON.stringify({ type: 'done', totalRestaurants: result.restaurants.length }) + '\n');
+    }
+
+    // Background: discover platform links for restaurants without cached links
+    const toDiscover = allRestaurantsForDiscovery
+      .filter(r => r.name && !getCachedPlatformLinks(r.name, cityKey, r.area));
+    if (toDiscover.length > 0 && !clientGone) {
+      console.log(`[omakase-search] discovering platform links for ${toDiscover.length} restaurants`);
+      const DISCOVER_CONCURRENCY = 3;
+      for (let i = 0; i < toDiscover.length && !clientGone; i += DISCOVER_CONCURRENCY) {
+        const batch = toDiscover.slice(i, i + DISCOVER_CONCURRENCY);
+        const results = await Promise.all(batch.map(async r => {
+          const links = await discoverPlatformLinks(r.name, cityKey, r.area);
+          const match = scoreByName.get(r.name);
+          return { ...links, tabelog_url: match?.tabelog_url || null, name: r.name, omakase_url: r.omakase_url };
+        }));
+        const withLinks = results.filter(r => r.tablecheck_url || r.tableall_url);
+        if (withLinks.length > 0 && !clientGone) {
+          res.write(JSON.stringify({ type: 'platform-update', restaurants: withLinks }) + '\n');
+        }
+      }
+    }
+
+    res.end();
+  } catch (error) {
+    console.error('[omakase-search] failed', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Omakase search failed', details: String(error) });
+    } else if (!clientGone) {
       res.write(JSON.stringify({ type: 'error', error: String(error) }) + '\n');
       res.end();
     }

@@ -44,6 +44,32 @@ accountsRouter.post('/', (req, res) => {
   }
 });
 
+// Validate account — test if stored cookies are still valid
+accountsRouter.post('/:id/validate', async (req, res) => {
+  const account = db.prepare(
+    'SELECT id, platform, cookie_data, last_login_at FROM booking_accounts WHERE id = ?'
+  ).get(req.params.id) as { id: string; platform: string; cookie_data: string | null; last_login_at: string | null } | undefined;
+
+  if (!account) {
+    res.status(404).json({ error: 'Account not found' });
+    return;
+  }
+
+  if (account.platform === 'omakase') {
+    try {
+      const { getOmakaseSession } = await import('../lib/scrapers/omakase.js');
+      const { context } = await getOmakaseSession();
+      await context.close();
+      res.json({ valid: true, last_login_at: account.last_login_at });
+    } catch (error) {
+      db.prepare("UPDATE booking_accounts SET is_valid = 0, updated_at = datetime('now') WHERE id = ?").run(account.id);
+      res.json({ valid: false, error: String(error) });
+    }
+  } else {
+    res.status(400).json({ error: `Validation not supported for platform: ${account.platform}` });
+  }
+});
+
 // Delete account
 accountsRouter.delete('/:id', (req, res) => {
   db.prepare('DELETE FROM booking_accounts WHERE id = ?').run(req.params.id);
