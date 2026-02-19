@@ -222,6 +222,8 @@ export function parseSearchPage(html: string, year: number): OmakaseRestaurant[]
 
     // Parse date headers from first row
     const dateColumns: string[] = [];
+    let currentYear = year;
+    let prevMonth = 0;
     table.find('tr').first().find('th').each((_j, th) => {
       const text = $(th).text().trim();
       // Format: "Feb 19\nThu" — extract month + day
@@ -230,7 +232,10 @@ export function parseSearchPage(html: string, year: number): OmakaseRestaurant[]
         const monthNum = MONTH_ABBREVS[dateMatch[1].toLowerCase().slice(0, 3)];
         const day = parseInt(dateMatch[2], 10);
         if (monthNum && !isNaN(day)) {
-          dateColumns.push(`${year}-${String(monthNum).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
+          // Detect year rollover (e.g. Dec -> Jan)
+          if (prevMonth > 0 && monthNum < prevMonth) currentYear++;
+          prevMonth = monthNum;
+          dateColumns.push(`${currentYear}-${String(monthNum).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
         }
       }
     });

@@ -470,6 +470,7 @@ export async function lookupScoresByName(
     const qWords = qNorm.split(' ');
     let bestMatch: { name: string; tabelog_url: string | null; tabelog_score: number | null } | null = null;
     let bestScore = 0;
+    let bestRatio = 0;
     for (const [norm, data] of normalizedIndex) {
       const cWords = norm.split(' ');
       const allQueryMatch = qWords.every(qw => cWords.some(cw => wordMatch(qw, cw)));
@@ -489,8 +490,9 @@ export async function lookupScoresByName(
         continue;
       }
 
-      if (shared > bestScore || (shared === bestScore && ratio > (bestMatch ? bestScore / maxWords : 0))) {
+      if (shared > bestScore || (shared === bestScore && ratio > bestRatio)) {
         bestScore = shared;
+        bestRatio = ratio;
         bestMatch = data;
       }
     }
