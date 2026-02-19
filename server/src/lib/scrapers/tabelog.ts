@@ -465,19 +465,33 @@ export async function lookupScoresByName(
     }
 
     // Step 1b. Fuzzy: all query words must match some candidate word, or vice versa
+    // When only one direction matches (subset), require high word overlap to avoid
+    // e.g. "Kioicho Mitani" (4.51) matching "Kioicho Mitani Bettei" (3.78)
     const qWords = qNorm.split(' ');
     let bestMatch: { name: string; tabelog_url: string | null; tabelog_score: number | null } | null = null;
-    let bestShared = 0;
+    let bestScore = 0;
     for (const [norm, data] of normalizedIndex) {
       const cWords = norm.split(' ');
       const allQueryMatch = qWords.every(qw => cWords.some(cw => wordMatch(qw, cw)));
       const allCandMatch = cWords.every(cw => qWords.some(qw => wordMatch(qw, cw)));
-      if (allQueryMatch || allCandMatch) {
-        const shared = qWords.filter(qw => cWords.some(cw => wordMatch(qw, cw))).length;
-        if (shared > bestShared) {
-          bestShared = shared;
-          bestMatch = data;
-        }
+      if (!allQueryMatch && !allCandMatch) continue;
+
+      const shared = qWords.filter(qw => cWords.some(cw => wordMatch(qw, cw))).length;
+      const maxWords = Math.max(qWords.length, cWords.length);
+      const ratio = shared / maxWords;
+
+      // Bidirectional match: accept if overlap ratio is decent
+      // One-directional (subset): require high overlap to avoid partial-name mismatches
+      if (allQueryMatch && allCandMatch) {
+        // Mutual match — good
+      } else if (ratio < 0.75) {
+        // One-directional with low overlap — skip to avoid wrong-restaurant matches
+        continue;
+      }
+
+      if (shared > bestScore || (shared === bestScore && ratio > (bestMatch ? bestScore / maxWords : 0))) {
+        bestScore = shared;
+        bestMatch = data;
       }
     }
     if (bestMatch) {
