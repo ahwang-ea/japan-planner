@@ -5,6 +5,7 @@ import { format } from 'date-fns';
 import { isInputFocused } from '../lib/keyboard';
 import TripForm from '../components/TripForm';
 import TripDetailPanel from '../components/TripDetailPanel';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 interface Trip {
   id: string;
@@ -17,6 +18,7 @@ interface Trip {
 }
 
 export default function Trips() {
+  const isMobile = useIsMobile();
   const [searchParams, setSearchParams] = useSearchParams();
   const [trips, setTrips] = useState<Trip[]>([]);
   const [showForm, setShowForm] = useState(false);
@@ -122,8 +124,34 @@ export default function Trips() {
         />
       )}
 
-      {/* Detail Panel (replaces list when open) */}
-      {detailIndex !== null && trips[detailIndex] ? (
+      {/* Mobile: full-screen detail overlay */}
+      {isMobile && detailIndex !== null && trips[detailIndex] && (
+        <div className="fixed inset-0 z-40 bg-white overflow-y-auto animate-slide-in-right">
+          <TripDetailPanel
+            tripId={trips[detailIndex].id}
+            onClose={() => setDetailIndex(null)}
+            onNext={() => {
+              if (detailIndex < trips.length - 1) {
+                setDetailIndex(detailIndex + 1);
+                setSelectedRowIndex(detailIndex + 1);
+              }
+            }}
+            onPrev={() => {
+              if (detailIndex > 0) {
+                setDetailIndex(detailIndex - 1);
+                setSelectedRowIndex(detailIndex - 1);
+              }
+            }}
+            hasPrev={detailIndex > 0}
+            hasNext={detailIndex < trips.length - 1}
+            onActivate={() => handleActivate(trips[detailIndex]!)}
+            isActive={!!trips[detailIndex]!.is_active}
+          />
+        </div>
+      )}
+
+      {/* Desktop: Detail Panel (replaces list when open) */}
+      {!isMobile && detailIndex !== null && trips[detailIndex] ? (
         <TripDetailPanel
           tripId={trips[detailIndex].id}
           onClose={() => setDetailIndex(null)}

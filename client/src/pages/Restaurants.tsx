@@ -4,10 +4,12 @@ import { api } from '../lib/api';
 import { isInputFocused } from '../lib/keyboard';
 import RestaurantForm from '../components/RestaurantForm';
 import RestaurantDetailPanel from '../components/RestaurantDetailPanel';
+import RestaurantCard from '../components/RestaurantCard';
 import AddToTripModal from '../components/AddToTripModal';
 import TripForm from '../components/TripForm';
 import SmartDateInput from '../components/SmartDateInput';
 import { CITIES, COMMON_CUISINES } from '../lib/constants';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 export interface Restaurant {
   id: string;
@@ -72,6 +74,7 @@ type Tab = 'saved' | 'browse';
 
 export default function Restaurants() {
   const navigate = useNavigate();
+  const isMobile = useIsMobile();
   const [searchParams, setSearchParams] = useSearchParams();
   const [tab, setTab] = useState<Tab>('browse');
   const [selectedRowIndex, setSelectedRowIndex] = useState(0);
@@ -114,6 +117,7 @@ export default function Restaurants() {
   const [tripHighlightIdx, setTripHighlightIdx] = useState(0);
   const tripPopoverRef = useRef<HTMLDivElement>(null);
   const [showNewTripModal, setShowNewTripModal] = useState(false);
+  const [showMobileFilters, setShowMobileFilters] = useState(false);
   const [appliedTripId, setAppliedTripId] = useState<string | null>(null);
   const [showBookableOnly, setShowBookableOnly] = useState(false);
   const [showSpotsOpenOnly, setShowSpotsOpenOnly] = useState(false);
@@ -1365,8 +1369,66 @@ export default function Restaurants() {
         )}
       </div>
 
-      {/* Detail Panel (replaces table when open) */}
-      {detailIndex !== null && currentList[detailIndex] ? (
+      {/* Mobile: full-screen detail overlay (shown on top of list) */}
+      {isMobile && detailIndex !== null && currentList[detailIndex] && (
+        <div className="fixed inset-0 z-40 bg-white overflow-y-auto animate-slide-in-right">
+          <RestaurantDetailPanel
+            restaurant={currentList[detailIndex]}
+            onClose={() => setDetailIndex(null)}
+            onNext={() => {
+              if (detailIndex < currentList.length - 1) {
+                setDetailIndex(detailIndex + 1);
+                setSelectedRowIndex(detailIndex + 1);
+              }
+            }}
+            onPrev={() => {
+              if (detailIndex > 0) {
+                setDetailIndex(detailIndex - 1);
+                setSelectedRowIndex(detailIndex - 1);
+              }
+            }}
+            hasPrev={detailIndex > 0}
+            hasNext={detailIndex < currentList.length - 1}
+            onFavoriteToggle={() => {
+              const item = currentList[detailIndex];
+              if (!item) return;
+              if ('id' in item) {
+                toggleFavorite((item as Restaurant).id);
+              } else if (item.tabelog_url) {
+                const match = saved.find(s => s.tabelog_url && item.tabelog_url && normalizeUrl(s.tabelog_url) === normalizeUrl(item.tabelog_url));
+                if (match) toggleFavorite(match.id);
+                else saveAndFavorite(item as TabelogResult);
+              }
+            }}
+            isFavorited={(() => {
+              const item = currentList[detailIndex];
+              if (!item) return false;
+              return 'id' in item
+                ? !!(item as Restaurant).is_favorite
+                : !!((item.tabelog_url && favoriteUrls.has(normalizeUrl(item.tabelog_url))) || (item.tableall_url && favoriteUrls.has(item.tableall_url)) || (item.tablecheck_url && favoriteUrls.has(item.tablecheck_url)));
+            })()}
+            isSaving={savingUrl === currentList[detailIndex]?.tabelog_url}
+            favoriteAnimating={(() => {
+              const item = currentList[detailIndex];
+              if (!item || !animatingFavorite) return false;
+              return ('id' in item && animatingFavorite === (item as Restaurant).id) ||
+                (item.tabelog_url === animatingFavorite);
+            })()}
+            availability={(() => {
+              const item = currentList[detailIndex];
+              if (!item?.tabelog_url) return null;
+              return availabilityMap.get(item.tabelog_url) ?? null;
+            })()}
+            filterDateFrom={filterDateFrom}
+            filterDateTo={filterDateTo}
+            filterMeals={filterMeals}
+            filterPartySize={filterPartySize}
+          />
+        </div>
+      )}
+
+      {/* Desktop: Detail Panel (replaces table when open) */}
+      {!isMobile && detailIndex !== null && currentList[detailIndex] ? (
         <RestaurantDetailPanel
           restaurant={currentList[detailIndex]}
           onClose={() => setDetailIndex(null)}
@@ -1425,12 +1487,12 @@ export default function Restaurants() {
           {tab === 'browse' && (
             <div className="overflow-x-hidden">
               {/* City + Cuisine filters */}
-              <div className="mb-4 flex items-center gap-1.5 flex-wrap">
+              <div className={`mb-4 flex items-center gap-1.5 ${isMobile ? 'overflow-x-auto pb-1 -mx-4 px-4' : 'flex-wrap'}`}>
                 {CITIES.map((c, i) => (
                   <button
                     key={c}
                     onClick={() => handleCityChange(c)}
-                    className={`px-2 py-1 text-xs rounded-md capitalize flex items-center gap-1 ${
+                    className={`px-2 py-1 text-xs rounded-md capitalize flex items-center gap-1 shrink-0 ${
                       c === city
                         ? 'bg-blue-600 text-white'
                         : 'bg-white border border-gray-200 text-gray-700 hover:bg-gray-50'
@@ -1442,7 +1504,7 @@ export default function Restaurants() {
                     }`}>{CITY_KEYS[i]}</kbd>
                   </button>
                 ))}
-                <span className="mx-1 text-gray-300">|</span>
+                <span className="mx-1 text-gray-300 shrink-0">|</span>
                 {/* Cuisine popover trigger */}
                 <div className="relative" ref={cuisinePopoverRef}>
                   <button
@@ -1461,6 +1523,51 @@ export default function Restaurants() {
                     const rect = cuisinePopoverRef.current?.getBoundingClientRect();
                     const top = rect ? rect.bottom + 4 : 0;
                     const left = rect ? Math.min(rect.left, window.innerWidth - 264) : 0;
+                    if (isMobile) return (
+                      <div className="fixed inset-0 z-50 bg-black/30" onClick={() => setCuisinePopoverOpen(false)}>
+                        <div className="absolute bottom-0 left-0 right-0 bg-white rounded-t-xl shadow-xl max-h-[70vh] overflow-hidden animate-slide-up" onClick={e => e.stopPropagation()}>
+                          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+                            <span className="text-sm font-medium text-gray-900">Cuisine</span>
+                            <button onClick={() => setCuisinePopoverOpen(false)} className="text-gray-400 text-xl leading-none p-1">&times;</button>
+                          </div>
+                          <div className="p-3 border-b border-gray-100">
+                            <input
+                              autoFocus
+                              type="text"
+                              value={cuisineQuery}
+                              onChange={e => { setCuisineQuery(e.target.value); setCuisineHighlightIdx(0); }}
+                              placeholder="Filter cuisines..."
+                              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400"
+                            />
+                          </div>
+                          <div className="overflow-y-auto py-1" style={{ maxHeight: 'calc(70vh - 110px)' }}>
+                            {filteredPopoverCuisines.map((c) => (
+                              <button
+                                key={c}
+                                onClick={() => toggleCuisine(c)}
+                                className="w-full text-left px-4 py-3 text-sm flex items-center gap-3 active:bg-gray-50"
+                              >
+                                <span className={`w-5 h-5 rounded border flex items-center justify-center shrink-0 ${
+                                  selectedCuisines.has(c)
+                                    ? 'bg-purple-600 border-purple-600 text-white'
+                                    : 'border-gray-300'
+                                }`}>
+                                  {selectedCuisines.has(c) && <span className="text-xs">✓</span>}
+                                </span>
+                                {c}
+                              </button>
+                            ))}
+                          </div>
+                          {selectedCuisines.size > 0 && (
+                            <div className="border-t border-gray-100 px-4 py-3">
+                              <button onClick={() => setSelectedCuisines(new Set())} className="text-sm text-gray-500 hover:text-gray-700 underline">
+                                Clear all ({selectedCuisines.size})
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
                     return (
                     <div style={{ position: 'fixed', top, left, width: 256 }} className="bg-white border border-gray-200 rounded-lg shadow-lg z-50 overflow-hidden">
                       <div className="p-2 border-b border-gray-100">
@@ -1544,8 +1651,34 @@ export default function Restaurants() {
                 )}
               </div>
 
-              {/* Date range & booking filters — always visible so dates can be entered before results load */}
-              <div className="mb-4 flex items-center gap-2 flex-wrap">
+              {/* Mobile filter toggle */}
+              {isMobile && (
+                <div className="mb-3 flex items-center gap-2">
+                  <button
+                    onClick={() => setShowMobileFilters(v => !v)}
+                    className={`flex items-center gap-1.5 px-3 py-2 text-xs rounded-lg ${
+                      showMobileFilters || filterDateFrom || filterDateTo || showBookableOnly || showSpotsOpenOnly || selectedCuisines.size > 0
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-white border border-gray-200 text-gray-600'
+                    }`}
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth={1.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-9.75 0h9.75" />
+                    </svg>
+                    Filters
+                    {(() => {
+                      const count = (filterDateFrom ? 1 : 0) + (showBookableOnly ? 1 : 0) + (showSpotsOpenOnly ? 1 : 0) + selectedCuisines.size + (filterMeals.size > 0 ? 1 : 0);
+                      return count > 0 ? <span className="bg-white/25 rounded-full px-1.5 text-[10px]">{count}</span> : null;
+                    })()}
+                  </button>
+                  {filterDateFrom && (
+                    <span className="text-xs text-gray-500">{filterDateFrom}{filterDateTo ? ` → ${filterDateTo}` : ''}</span>
+                  )}
+                </div>
+              )}
+
+              {/* Date range & booking filters — always visible on desktop, collapsible on mobile */}
+              <div className={`mb-4 flex items-center gap-2 flex-wrap ${isMobile && !showMobileFilters ? 'hidden' : ''}`}>
                 <span className="text-xs font-medium text-gray-500 uppercase mr-1">When:</span>
                   <div className="w-40" id="date-from">
                     <SmartDateInput
@@ -1600,6 +1733,38 @@ export default function Restaurants() {
                       const top = rect ? rect.bottom + 4 : 0;
                       const left = rect ? Math.min(rect.left, window.innerWidth - 260) : 0;
                       const items = [...trips, { id: '__new__', name: '+ New Trip', city: null, start_date: '', end_date: '' }];
+                      if (isMobile) return (
+                        <div className="fixed inset-0 z-50 bg-black/30" onClick={() => setTripPopoverOpen(false)}>
+                          <div className="absolute bottom-0 left-0 right-0 bg-white rounded-t-xl shadow-xl animate-slide-up" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+                              <span className="text-sm font-medium text-gray-900">Select Trip</span>
+                              <button onClick={() => setTripPopoverOpen(false)} className="text-gray-400 text-xl leading-none p-1">&times;</button>
+                            </div>
+                            <div className="py-1 max-h-[60vh] overflow-y-auto">
+                              {items.map((item) => (
+                                <button
+                                  key={item.id}
+                                  onClick={() => {
+                                    setTripPopoverOpen(false);
+                                    if (item.id === '__new__') setShowNewTripModal(true);
+                                    else applyTrip(item);
+                                  }}
+                                  className={`w-full text-left px-4 py-3 text-sm active:bg-gray-50 ${
+                                    item.id === '__new__' ? 'border-t border-gray-100 font-medium text-blue-600' : ''
+                                  } ${item.id === appliedTripId ? 'font-medium text-teal-600' : ''}`}
+                                >
+                                  {item.id === '__new__' ? item.name : (
+                                    <span className="flex items-center justify-between gap-2">
+                                      <span className="truncate">{item.name}</span>
+                                      <span className="text-gray-400 text-xs shrink-0">{item.start_date} – {item.end_date}</span>
+                                    </span>
+                                  )}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      );
                       return (
                         <div
                           style={{ position: 'fixed', top, left, width: 260 }}
@@ -1698,6 +1863,29 @@ export default function Restaurants() {
                       const rect = partySizePopoverRef.current?.getBoundingClientRect();
                       const top = rect ? rect.bottom + 4 : 0;
                       const left = rect ? Math.min(rect.left, window.innerWidth - 160) : 0;
+                      if (isMobile) return (
+                        <div className="fixed inset-0 z-50 bg-black/30" onClick={() => setPartySizePopoverOpen(false)}>
+                          <div className="absolute bottom-0 left-0 right-0 bg-white rounded-t-xl shadow-xl animate-slide-up" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+                              <span className="text-sm font-medium text-gray-900">Party Size</span>
+                              <button onClick={() => setPartySizePopoverOpen(false)} className="text-gray-400 text-xl leading-none p-1">&times;</button>
+                            </div>
+                            <div className="py-1 grid grid-cols-5 gap-1 p-3">
+                              {[1,2,3,4,5,6,7,8,9,10].map((n) => (
+                                <button
+                                  key={n}
+                                  onClick={() => { setFilterPartySize(n); setPartySizePopoverOpen(false); }}
+                                  className={`py-3 text-sm rounded-lg text-center ${
+                                    filterPartySize === n ? 'bg-indigo-600 text-white font-medium' : 'bg-gray-100 text-gray-700 active:bg-gray-200'
+                                  }`}
+                                >
+                                  {n}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </div>
+                      );
                       return (
                         <div
                           style={{ position: 'fixed', top, left, width: 140 }}
@@ -1753,7 +1941,7 @@ export default function Restaurants() {
 
               {/* Availability filters */}
               {(browseResults.length > 0 || allResults.length > 0) && (
-                <div className="mb-4 flex items-center gap-2 flex-wrap">
+                <div className={`mb-4 flex items-center gap-2 flex-wrap ${isMobile && !showMobileFilters ? 'hidden' : ''}`}>
                   <span className="text-xs font-medium text-gray-500 uppercase mr-1">Source:</span>
                   <button
                     onClick={() => { if (!showTabelog || showTableAll || showTableCheck || showOmakase) setShowTabelog(v => !v); }}
@@ -1930,6 +2118,36 @@ export default function Restaurants() {
                       </div>
                     );
                   })()}
+                  {isMobile ? (
+                    <div className="space-y-2">
+                      {filteredResults.map((r, idx) => {
+                        const primaryUrl = r.tabelog_url || r.tableall_url || r.tablecheck_url || r.omakase_url;
+                        const isFav = (r.tabelog_url && favoriteUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && favoriteUrls.has(r.tableall_url)) || (r.tablecheck_url && favoriteUrls.has(r.tablecheck_url)) || false;
+                        const isInTrip = (r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url)) || (r.tablecheck_url && tripRestaurantUrls.has(r.tablecheck_url)) || (r.omakase_url && tripRestaurantUrls.has(r.omakase_url)) || false;
+                        return (
+                          <RestaurantCard
+                            key={primaryUrl || idx}
+                            restaurant={r}
+                            index={idx}
+                            isSelected={idx === selectedRowIndex}
+                            isFavorited={!!isFav}
+                            isInTrip={!!isInTrip}
+                            onSelect={() => { setSelectedRowIndex(idx); setDetailIndex(idx); }}
+                            onFavorite={() => {
+                              if (r.tabelog_url) {
+                                const match = saved.find(s => s.tabelog_url && r.tabelog_url && normalizeUrl(s.tabelog_url) === normalizeUrl(r.tabelog_url));
+                                if (match) toggleFavorite(match.id);
+                                else saveAndFavorite(r as TabelogResult);
+                              }
+                            }}
+                          />
+                        );
+                      })}
+                      {filteredResults.length === 0 && !stillSearching && (
+                        <p className="text-gray-500 text-center py-8">No results found.</p>
+                      )}
+                    </div>
+                  ) : (
                   <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
                     <table className="min-w-full divide-y divide-gray-200">
                       <thead className="bg-gray-50">
@@ -2179,6 +2397,7 @@ export default function Restaurants() {
                       <span><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500">b</kbd><kbd className="px-1 py-0.5 bg-gray-200 rounded text-gray-500 ml-0.5">s</kbd> booking</span>
                     </div>
                   </div>
+                  )}
 
                   {/* Pagination / Load more */}
                   {isFiltering ? (() => {
@@ -2251,7 +2470,25 @@ export default function Restaurants() {
                 <p className="text-gray-500">Loading...</p>
               ) : saved.length === 0 ? (
                 <p className="text-gray-500">No restaurants saved yet. Browse Tabelog to add some.</p>
-              ) : (
+              ) : isMobile ? (
+                  <div className="space-y-2">
+                    {displayedSaved.map((r, idx) => {
+                      const isInTrip = ((r.tabelog_url && tripRestaurantUrls.has(normalizeUrl(r.tabelog_url))) || (r.tableall_url && tripRestaurantUrls.has(r.tableall_url)) || (r.tablecheck_url && tripRestaurantUrls.has(r.tablecheck_url))) || false;
+                      return (
+                        <RestaurantCard
+                          key={r.id}
+                          restaurant={r}
+                          index={idx}
+                          isSelected={idx === selectedRowIndex}
+                          isFavorited={!!r.is_favorite}
+                          isInTrip={!!isInTrip}
+                          onSelect={() => { setSelectedRowIndex(idx); setDetailIndex(idx); }}
+                          onFavorite={() => toggleFavorite(r.id)}
+                        />
+                      );
+                    })}
+                  </div>
+                ) : (
                 <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
                   <table className="min-w-full divide-y divide-gray-200">
                     <thead className="bg-gray-50">

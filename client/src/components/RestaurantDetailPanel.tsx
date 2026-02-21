@@ -78,6 +78,7 @@ export default function RestaurantDetailPanel({
   const [showGallery, setShowGallery] = useState(false);
   const [photoCategory, setPhotoCategory] = useState('all');
   const [galleryPhotos, setGalleryPhotos] = useState<string[] | null>(null);
+  const [touchStartX, setTouchStartX] = useState<number | null>(null);
 
   // Review state
   const [reviews, setReviews] = useState<TabelogReview[]>([]);
@@ -305,6 +306,14 @@ export default function RestaurantDetailPanel({
                   className={`w-full h-56 object-cover ${displayPhotos.length > 1 ? 'cursor-pointer' : ''}`}
                   onClick={() => { if (displayPhotos.length > 1) { setGalleryPhotos(null); setShowGallery(true); } }}
                   onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                  onTouchStart={e => setTouchStartX(e.touches[0].clientX)}
+                  onTouchEnd={e => {
+                    if (touchStartX === null) return;
+                    const diff = e.changedTouches[0].clientX - touchStartX;
+                    if (diff > 50 && photoIndex > 0) setPhotoIndex(i => i - 1);
+                    if (diff < -50 && photoIndex < displayPhotos.length - 1) setPhotoIndex(i => i + 1);
+                    setTouchStartX(null);
+                  }}
                 />
               ) : (
                 <div className="w-full h-56 bg-gray-100 flex items-center justify-center">
