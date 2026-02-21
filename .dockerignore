@@ -1,0 +1,15 @@
+node_modules
+server/node_modules
+client/node_modules
+server/dist
+client/dist
+server/data
+server/playwright-data
+.env
+.port
+.context
+*.db
+*.db-wal
+*.db-shm
+.git
+.gitignore

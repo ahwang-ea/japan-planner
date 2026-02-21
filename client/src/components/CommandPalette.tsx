@@ -53,7 +53,7 @@ export default function CommandPalette({ query, setQuery, filteredCommands, sele
   let flatIndex = -1;
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[20vh]" onClick={close}>
+    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh] md:pt-[20vh] px-4" onClick={close}>
       <div className="fixed inset-0 bg-black/50 backdrop-blur-sm" />
       <div
         className="relative w-full max-w-lg bg-white rounded-xl shadow-2xl border border-gray-200 overflow-hidden"

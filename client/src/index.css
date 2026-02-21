@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+/* PWA-ready safe area support */
+@supports (padding: env(safe-area-inset-bottom)) {
+  :root {
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+    --safe-top: env(safe-area-inset-top, 0px);
+  }
+}
+
 @layer base {
   *:focus-visible {
     outline: 2px solid #3b82f6;
@@ -10,6 +18,16 @@
   *:focus:not(:focus-visible) {
     outline: none;
   }
+
+  /* Prevent iOS double-tap zoom on interactive elements */
+  button, a, [role="button"] {
+    touch-action: manipulation;
+  }
+}
+
+/* Hide keyboard shortcut hints on mobile */
+@media (max-width: 767px) {
+  kbd { display: none !important; }
 }
 
 @keyframes favorite-pop {
@@ -32,4 +50,22 @@
 
 .animate-fade-in-up {
   animation: fade-in-up 0.15s ease-out;
+}
+
+@keyframes slide-up {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.2s ease-out;
+}
+
+@keyframes slide-in-right {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+.animate-slide-in-right {
+  animation: slide-in-right 0.2s ease-out;
 }
